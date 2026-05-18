@@ -5,7 +5,11 @@ import {
   decodeProtobufValue,
   jsonSchemaToProtobufValue,
 } from "../../open-sse/utils/cursorAgentProtobuf";
-import { newStreamCtx, processFrame } from "../../open-sse/executors/cursor";
+import {
+  collectCompletedToolResults,
+  newStreamCtx,
+  processFrame,
+} from "../../open-sse/executors/cursor";
 
 // ─── Wire-format helpers ───────────────────────────────────────────────────
 
@@ -345,4 +349,34 @@ test("processFrame extracts read_file content from truncated JSON-ish tool resul
 
   assert.equal(ctx.endReason, "turn_ended");
   assert.equal(ctx.totalText, "hello from foo");
+});
+
+test("collectCompletedToolResults handles cursor-translated tool result blocks", () => {
+  const results = collectCompletedToolResults([
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        {
+          id: "call_read",
+          type: "function",
+          function: { name: "read_file", arguments: '{"path":"/tmp/foo.txt"}' },
+        },
+      ],
+    },
+    {
+      role: "user",
+      content:
+        "<tool_result>\n" +
+        "<tool_name>read_file</tool_name>\n" +
+        "<tool_call_id>call_read</tool_call_id>\n" +
+        "<result>{&quot;content&quot;: &quot;     1|hello from foo&quot;}</result>\n" +
+        "</tool_result>",
+    },
+  ]);
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0].name, "read_file");
+  assert.equal(results[0].argumentsJson, '{"path":"/tmp/foo.txt"}');
+  assert.equal(results[0].content, '{"content": "     1|hello from foo"}');
 });

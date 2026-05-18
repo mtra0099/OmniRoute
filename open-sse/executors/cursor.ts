@@ -340,7 +340,27 @@ function normalizeToolArgsJson(value: unknown): string {
   return JSON.stringify(value ?? {});
 }
 
-function collectCompletedToolResults(messages: ChatMessage[]): CompletedToolResult[] {
+function isConvertedToolResultMessage(msg: ChatMessage | undefined): boolean {
+  return (
+    msg?.role === "user" && typeof msg.content === "string" && msg.content.includes("<tool_result>")
+  );
+}
+
+function unescapeXml(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+function extractXmlTag(text: string, tag: string): string {
+  const match = text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`));
+  return match ? unescapeXml(match[1]) : "";
+}
+
+export function collectCompletedToolResults(messages: ChatMessage[]): CompletedToolResult[] {
   const callsById = new Map<string, { name: string; argumentsJson: string }>();
   const results: CompletedToolResult[] = [];
 
@@ -359,6 +379,16 @@ function collectCompletedToolResults(messages: ChatMessage[]): CompletedToolResu
       results.push({
         ...call,
         content: messageContentToText(msg.content),
+      });
+    } else if (isConvertedToolResultMessage(msg) && typeof msg.content === "string") {
+      const toolCallId = extractXmlTag(msg.content, "tool_call_id");
+      const call = callsById.get(toolCallId);
+      const name = extractXmlTag(msg.content, "tool_name") || call?.name || "";
+      if (!name) continue;
+      results.push({
+        name,
+        argumentsJson: call?.argumentsJson ?? "{}",
+        content: extractXmlTag(msg.content, "result"),
       });
     }
   }
@@ -1046,7 +1076,8 @@ export class CursorExecutor extends BaseExecutor {
         ? body.conversation_id
         : crypto.randomUUID();
     const lastMessage = messages[messages.length - 1];
-    const isToolFollowUp = lastMessage?.role === "tool";
+    const isToolFollowUp =
+      lastMessage?.role === "tool" || isConvertedToolResultMessage(lastMessage);
     const useInlineToolFollowUp = isToolFollowUp && !model.toLowerCase().includes("grok");
     const completedToolResults = collectCompletedToolResults(messages);
 
