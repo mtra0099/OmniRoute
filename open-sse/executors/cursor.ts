@@ -1095,11 +1095,9 @@ export class CursorExecutor extends BaseExecutor {
         { status, headers: { "Content-Type": "application/json" } }
       );
 
-    const completedReadFileResult = model.toLowerCase().includes("grok")
-      ? [...completedToolResults]
-          .reverse()
-          .find((result) => result.name === "read_file" && formatCompletedToolResultContent(result))
-      : undefined;
+    const completedReadFileResult = [...completedToolResults]
+      .reverse()
+      .find((result) => result.name === "read_file" && formatCompletedToolResultContent(result));
     if (isToolFollowUp && completedReadFileResult) {
       const content = formatCompletedToolResultContent(completedReadFileResult);
       if (stream !== false) {
