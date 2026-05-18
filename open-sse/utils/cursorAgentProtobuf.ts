@@ -1396,5 +1396,22 @@ export function flattenMessages(messages: ChatMessage[]): string {
     }
   }
   const labelled = lines.join("\n\n");
-  return systemTexts.length > 0 ? `${systemTexts.join("\n\n")}\n\n${labelled}` : labelled;
+
+  // Continuation cue. When the conversation history ends on a tool result,
+  // cursor's backend reads the flattened recap as a passive transcript and
+  // emits empty/near-empty output ("ok", "I see"). Adding an explicit
+  // continuation directive tells the model that the tool just executed and
+  // it should take the next step. Without this, multi-turn tool flows from
+  // agents like Hermes/opencode silently fail after the first tool call.
+  const lastMessage = turn[turn.length - 1];
+  const continuationPrompt =
+    lastMessage?.role === "tool"
+      ? "\n\nThe tool result above was returned for your most recent tool call. " +
+        "Continue from where you left off: take the next action — either call another " +
+        "tool, or provide the final answer to the user's original request. Do not " +
+        "summarize what just happened; advance the task."
+      : "";
+
+  const body = `${labelled}${continuationPrompt}`;
+  return systemTexts.length > 0 ? `${systemTexts.join("\n\n")}\n\n${body}` : body;
 }
