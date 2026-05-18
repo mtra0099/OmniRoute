@@ -938,8 +938,7 @@ export class CursorExecutor extends BaseExecutor {
       typeof body.conversation_id === "string" && body.conversation_id
         ? body.conversation_id
         : crypto.randomUUID();
-    const lastMessage = messages[messages.length - 1];
-    const isToolFollowUp = lastMessage?.role === "tool";
+    const isToolFollowUp = messages.some((msg) => msg.role === "tool");
 
     // Tools embedded in the RequestContext ack throughout the turn —
     // synced with mcp_tools in the encoded request body.
@@ -976,8 +975,8 @@ export class CursorExecutor extends BaseExecutor {
 
     // ── h2 path with inline session manager (Phase 6) ──
     //
-    // 1. If this is a tool-result follow-up (last message role:"tool") AND
-    //    we have an alive session for the conversation, send the tool
+    // 1. If this is a tool-result follow-up and we have an alive session
+    //    for the conversation or tool_call_id, send the tool
     //    result on the existing h2 stream (inline resume).
     // 2. Otherwise, open a fresh h2 stream, send a new RunRequest, and
     //    register it as a session.
