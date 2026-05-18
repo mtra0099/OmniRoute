@@ -152,6 +152,40 @@ test("CursorSessionManager.acquire returns the session after release(awaiting_to
   assert.equal(acquired?.state, "running");
 });
 
+test("CursorSessionManager.acquireByToolCallId matches clients without conversation_id", () => {
+  const m = new CursorSessionManager();
+  const { req } = mockReq();
+  const { client } = mockClient();
+  const opened = m.open("generated-conv", client, req, new Map());
+  opened.pendingToolCalls.set("call_without_conversation", {
+    kind: "exec_mcp",
+    execMsgId: 1,
+    execId: "exec-1",
+    toolName: "read_file",
+  });
+  m.release(opened, "awaiting_tool_result");
+
+  const acquired = m.acquireByToolCallId("call_without_conversation");
+
+  assert.equal(acquired, opened);
+  assert.equal(acquired?.state, "running");
+});
+
+test("CursorSessionManager.acquireByToolCallId ignores running sessions", () => {
+  const m = new CursorSessionManager();
+  const { req } = mockReq();
+  const { client } = mockClient();
+  const opened = m.open("generated-running", client, req, new Map());
+  opened.pendingToolCalls.set("call_running", {
+    kind: "exec_mcp",
+    execMsgId: 1,
+    execId: "exec-1",
+    toolName: "read_file",
+  });
+
+  assert.equal(m.acquireByToolCallId("call_running"), undefined);
+});
+
 test("CursorSessionManager.release(idle) closes the session", () => {
   const m = new CursorSessionManager();
   const { req, calls } = mockReq();

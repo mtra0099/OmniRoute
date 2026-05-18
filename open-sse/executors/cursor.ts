@@ -999,6 +999,13 @@ export class CursorExecutor extends BaseExecutor {
 
     if (isToolFollowUp) {
       session = cursorSessionManager.acquire(conversationId);
+      if (!session) {
+        for (const msg of messages) {
+          if (msg.role !== "tool") continue;
+          session = cursorSessionManager.acquireByToolCallId(msg.tool_call_id ?? "");
+          if (session) break;
+        }
+      }
     }
 
     if (session) {

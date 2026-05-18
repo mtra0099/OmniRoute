@@ -20,6 +20,10 @@
  * with all history flattened into UserText). Cold-resume is correctness-
  * preserving but loses the inline efficiency.
  *
+ * Some clients do not send `conversation_id`. For those clients, follow-up
+ * tool-result calls can still be matched by the OpenAI tool_call_id that
+ * OmniRoute emitted on the prior turn.
+ *
  * Concurrency: one in-flight call per session. The acquire/release pattern
  * keeps a session in "awaiting_tool_result" between calls; if a second call
  * arrives while the first is still running, acquire() returns undefined and
@@ -70,6 +74,19 @@ export class CursorSessionManager {
     session.state = "running";
     session.lastActivityTs = Date.now();
     return session;
+  }
+
+  acquireByToolCallId(openAIToolCallId: string): CursorSession | undefined {
+    this.evictExpired();
+    if (!openAIToolCallId) return undefined;
+    for (const session of this.sessions.values()) {
+      if (session.state !== "awaiting_tool_result") continue;
+      if (!session.pendingToolCalls.has(openAIToolCallId)) continue;
+      session.state = "running";
+      session.lastActivityTs = Date.now();
+      return session;
+    }
+    return undefined;
   }
 
   /**
