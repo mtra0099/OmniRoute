@@ -1064,6 +1064,53 @@ export class CursorExecutor extends BaseExecutor {
         { status, headers: { "Content-Type": "application/json" } }
       );
 
+    const completedReadFileResult = model.toLowerCase().includes("grok")
+      ? [...completedToolResults]
+          .reverse()
+          .find((result) => result.name === "read_file" && formatCompletedToolResultContent(result))
+      : undefined;
+    if (isToolFollowUp && completedReadFileResult) {
+      const content = formatCompletedToolResultContent(completedReadFileResult);
+      if (stream !== false) {
+        const enc = new TextEncoder();
+        const sseStream = new ReadableStream({
+          start: (controller) => {
+            const ctx = newStreamCtx(model, (s) => controller.enqueue(enc.encode(s)));
+            emitChunk(ctx, { role: "assistant", content: "" });
+            ctx.emittedRoleChunk = true;
+            ctx.totalText = content;
+            ctx.receivedText = true;
+            emitChunk(ctx, { content });
+            this.finalizeSseStream(ctx, body);
+            controller.close();
+          },
+        });
+        return {
+          response: new Response(sseStream, {
+            status: 200,
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+            },
+          }),
+          url,
+          headers,
+          transformedBody: body,
+        };
+      }
+
+      const ctx = newStreamCtx(model, () => {});
+      ctx.totalText = content;
+      ctx.receivedText = true;
+      return {
+        response: this.buildResponseFromCtx(ctx, body),
+        url,
+        headers,
+        transformedBody: body,
+      };
+    }
+
     // Cursor's agent.v1.AgentService/Run is a bidirectional Connect-RPC:
     // request_context, KV blob lookups, and exec rejections must be
     // written back on the same h2 stream while the response is still
