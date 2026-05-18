@@ -29,6 +29,7 @@ import type { AutoVariant } from "@omniroute/open-sse/services/autoCombo/autoPre
 import * as log from "../utils/logger";
 import { checkAndRefreshToken } from "../services/tokenRefresh";
 import { deleteHandoff, getHandoff } from "@/lib/db/contextHandoffs";
+import { deleteSessionAccountAffinity } from "@/lib/db/sessionAccountAffinity";
 import { getCachedSettings, getCombos } from "@/lib/localDb";
 import {
   ensureOpenAIStoreSessionFallback,
@@ -947,6 +948,31 @@ async function handleSingleModelChat(
         if (telemetry) telemetry.startPhase("finalize");
         if (telemetry) telemetry.endPhase();
         return result.response;
+      }
+
+      if (
+        result.errorType === "stream_early_eof" &&
+        provider === "cursor" &&
+        !hasForcedConnection
+      ) {
+        log.warn(
+          "AUTH",
+          `Cursor account ${accountId}... ended before useful content; trying fallback account`
+        );
+        excludedConnectionIds.add(credentials.connectionId);
+        const affinityKey = runtimeOptions.sessionAffinityKey ?? runtimeOptions.sessionId ?? null;
+        if (affinityKey) {
+          try {
+            deleteSessionAccountAffinity(affinityKey, provider);
+          } catch {
+            // Best-effort: account exclusion still prevents immediate reuse in this request.
+          }
+        }
+        lastError = result.error;
+        lastStatus = result.status;
+        requestRetryLastError = result.error;
+        requestRetryLastStatus = result.status;
+        continue;
       }
 
       if (result.errorType === "stream_timeout" || result.errorType === "stream_early_eof") {
