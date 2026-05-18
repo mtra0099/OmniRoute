@@ -46,7 +46,11 @@ import {
 import { getCursorVersion } from "../utils/cursorVersionDetector.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import { generateToolCallId } from "../translator/helpers/toolCallHelper.ts";
-import { cursorSessionManager, type CursorSession } from "../services/cursorSessionManager.ts";
+import {
+  cursorSessionManager,
+  type CursorPendingToolCall,
+  type CursorSession,
+} from "../services/cursorSessionManager.ts";
 import {
   isCreditsExhausted,
   isAccountDeactivated,
@@ -198,6 +202,21 @@ function buildExecRejection(event: ExecServerEvent): Buffer | null {
   }
 }
 
+function findClientToolNameForBuiltin(
+  event: ExecServerEvent,
+  tools: McpToolDefinition[] | undefined
+): string | null {
+  if (!tools || tools.length === 0) return null;
+  const names = new Set(tools.map((tool) => tool.toolName || tool.name));
+  const candidates = event.kind === "exec_read" ? ["read_file", "readFile", "read", "Read"] : [];
+  return candidates.find((name) => names.has(name)) ?? null;
+}
+
+function builtinToolArguments(event: ExecServerEvent): Record<string, unknown> | null {
+  if (event.kind === "exec_read") return { path: event.path };
+  return null;
+}
+
 const CURSOR_AGENT_HOST = "agentn.global.api5.cursor.sh";
 const CURSOR_AGENT_PATH = "/agent.v1.AgentService/Run";
 const CURSOR_AGENT_URL = `https://${CURSOR_AGENT_HOST}${CURSOR_AGENT_PATH}`;
@@ -299,7 +318,7 @@ export type StreamCtx = {
   // Phase 6: maps OpenAI tool_call_id → cursor exec info, so a follow-up
   // role:"tool" message can be answered on the open h2 stream via
   // encodeExecMcpResult.
-  pendingToolCalls: Map<string, { execMsgId: number; execId: string; toolName: string }>;
+  pendingToolCalls: Map<string, CursorPendingToolCall>;
 };
 
 export function newStreamCtx(model: string, emit: (chunk: string) => void): StreamCtx {
@@ -485,6 +504,7 @@ export function processFrame(
       // Phase 6: remember the cursor exec ids so a follow-up role:"tool"
       // message can be replied with encodeExecMcpResult on the open h2 stream.
       ctx.pendingToolCalls.set(openAIToolCallId, {
+        kind: "exec_mcp",
         execMsgId: event.execMsgId,
         execId: event.execId,
         toolName: event.toolName,
@@ -495,6 +515,49 @@ export function processFrame(
       // alive for the next OpenAI call (which arrives with role:"tool").
       ctx.endReason = "tool_calls";
     } else {
+      const toolName = findClientToolNameForBuiltin(event, opts.mcpTools);
+      const args = builtinToolArguments(event);
+      if (event.kind === "exec_read" && toolName && args) {
+        if (!ctx.emittedRoleChunk) {
+          emitChunk(ctx, { role: "assistant", content: "" });
+          ctx.emittedRoleChunk = true;
+        }
+        const idx = ctx.emittedToolCallIndex++;
+        const openAIToolCallId = generateToolCallId();
+        const argumentsJson = JSON.stringify(args);
+        emitChunk(ctx, {
+          tool_calls: [
+            {
+              index: idx,
+              id: openAIToolCallId,
+              type: "function",
+              function: { name: toolName, arguments: "" },
+            },
+          ],
+        });
+        emitChunk(ctx, {
+          tool_calls: [
+            {
+              index: idx,
+              function: { arguments: argumentsJson },
+            },
+          ],
+        });
+        ctx.toolCalls.push({
+          id: openAIToolCallId,
+          name: toolName,
+          argumentsJson,
+        });
+        ctx.pendingToolCalls.set(openAIToolCallId, {
+          kind: "exec_read",
+          execMsgId: event.execMsgId,
+          execId: event.execId,
+          toolName,
+          path: event.path,
+        });
+        ctx.endReason = "tool_calls";
+        return;
+      }
       const rejection = buildExecRejection(event);
       if (rejection && opts.h2Req) {
         try {

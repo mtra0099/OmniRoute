@@ -31,7 +31,7 @@
  */
 
 import type { ClientHttp2Session, ClientHttp2Stream } from "node:http2";
-import { encodeExecMcpResult } from "../utils/cursorAgentProtobuf.ts";
+import { encodeExecMcpResult, encodeExecReadResult } from "../utils/cursorAgentProtobuf.ts";
 
 const DEFAULT_IDLE_TTL_MS = 5 * 60 * 1000;
 
@@ -40,10 +40,14 @@ export type CursorSession = {
   h2Client: ClientHttp2Session;
   h2Req: ClientHttp2Stream;
   blobStore: Map<string, Buffer>;
-  pendingToolCalls: Map<string, { execMsgId: number; execId: string; toolName: string }>;
+  pendingToolCalls: Map<string, CursorPendingToolCall>;
   state: "running" | "awaiting_tool_result" | "closed";
   lastActivityTs: number;
 };
+
+export type CursorPendingToolCall =
+  | { kind: "exec_mcp"; execMsgId: number; execId: string; toolName: string }
+  | { kind: "exec_read"; execMsgId: number; execId: string; toolName: string; path: string };
 
 export class CursorSessionManager {
   private sessions = new Map<string, CursorSession>();
@@ -133,7 +137,15 @@ export class CursorSessionManager {
     const pending = session.pendingToolCalls.get(openAIToolCallId);
     if (!pending) return false;
     try {
-      session.h2Req.write(encodeExecMcpResult(pending.execMsgId, pending.execId, content, isError));
+      if (pending.kind === "exec_read") {
+        session.h2Req.write(
+          encodeExecReadResult(pending.execMsgId, pending.execId, pending.path, content)
+        );
+      } else {
+        session.h2Req.write(
+          encodeExecMcpResult(pending.execMsgId, pending.execId, content, isError)
+        );
+      }
       session.pendingToolCalls.delete(openAIToolCallId);
       session.lastActivityTs = Date.now();
       return true;

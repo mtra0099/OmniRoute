@@ -9,6 +9,7 @@ import {
   flattenMessages,
   wrapConnectFrame,
   encodeExecReadRejected,
+  encodeExecReadResult,
   encodeExecWriteRejected,
   encodeExecDeleteRejected,
   encodeExecLsRejected,
@@ -188,6 +189,14 @@ test("encodeExecReadRejected wraps in read_result (field 7) with reason", () => 
   const payload = unwrapFrame(framed);
   assert.ok(payload.includes(Buffer.from("/etc/passwd", "utf8")));
   assert.ok(payload.includes(Buffer.from("denied", "utf8")));
+});
+
+test("encodeExecReadResult wraps read success content in read_result", () => {
+  const framed = encodeExecReadResult(42, "exec-read", "/tmp/foo.txt", "hello\nworld");
+  assertEcmShape(framed, 42, "exec-read", 7);
+  const payload = unwrapFrame(framed);
+  assert.ok(payload.includes(Buffer.from("/tmp/foo.txt", "utf8")));
+  assert.ok(payload.includes(Buffer.from("hello\nworld", "utf8")));
 });
 
 test("encodeExecWriteRejected wraps in write_result (field 3)", () => {

@@ -62,6 +62,16 @@ function buildMcpArgsEvent(
   return lenPrefixed(2, esm);
 }
 
+function buildReadArgsEvent(execMsgId: number, execId: string, filePath: string): Buffer {
+  const readArgs = stringField(1, filePath);
+  const esm = Buffer.concat([
+    varintField(1, execMsgId),
+    stringField(15, execId),
+    lenPrefixed(7, readArgs),
+  ]);
+  return lenPrefixed(2, esm);
+}
+
 // ─── decodeProtobufValue round-trip tests ──────────────────────────────────
 
 test("decodeProtobufValue round-trips primitives", () => {
@@ -233,4 +243,31 @@ test("processFrame doesn't emit tool_calls for the same exec_id twice", () => {
   processFrame(payload, ctx, acked);
   processFrame(payload, ctx, acked);
   assert.equal(ctx.toolCalls.length, 1);
+});
+
+test("processFrame surfaces Cursor built-in read as a matching OpenAI tool_call", () => {
+  const emitted: string[] = [];
+  const ctx = newStreamCtx("auto", (s) => emitted.push(s));
+  const acked = new Set<string>();
+
+  processFrame(buildReadArgsEvent(11, "exec-read", "/tmp/foo.txt"), ctx, acked, {
+    mcpTools: [
+      {
+        name: "read_file",
+        description: "Read a file",
+        inputSchemaBytes: Buffer.alloc(0),
+        toolName: "read_file",
+      },
+    ],
+  });
+
+  assert.equal(ctx.endReason, "tool_calls");
+  assert.equal(ctx.toolCalls.length, 1);
+  assert.equal(ctx.toolCalls[0].name, "read_file");
+  assert.equal(ctx.toolCalls[0].argumentsJson, JSON.stringify({ path: "/tmp/foo.txt" }));
+
+  const initChunk = parseChunk(emitted[1]);
+  assert.equal(initChunk.delta?.tool_calls?.[0].function?.name, "read_file");
+  const argsChunk = parseChunk(emitted[2]);
+  assert.equal(argsChunk.delta?.tool_calls?.[0].function?.arguments, '{"path":"/tmp/foo.txt"}');
 });

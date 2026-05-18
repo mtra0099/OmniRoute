@@ -183,6 +183,7 @@ test("CursorSessionManager.sendToolResult writes ExecMcpResult on the session's 
   const { client } = mockClient();
   const session = m.open("conv-6", client, req, new Map());
   session.pendingToolCalls.set("call_x", {
+    kind: "exec_mcp",
     execMsgId: 1,
     execId: "exec-1",
     toolName: "get_weather",
@@ -198,6 +199,30 @@ test("CursorSessionManager.sendToolResult writes ExecMcpResult on the session's 
   assert.ok(data.includes(Buffer.from("exec-1", "utf8")));
   // Pending tool call was consumed
   assert.equal(session.pendingToolCalls.has("call_x"), false);
+});
+
+test("CursorSessionManager.sendToolResult writes ExecReadResult for built-in read calls", () => {
+  const m = new CursorSessionManager();
+  const { req, calls } = mockReq();
+  const { client } = mockClient();
+  const session = m.open("conv-read", client, req, new Map());
+  session.pendingToolCalls.set("call_read", {
+    kind: "exec_read",
+    execMsgId: 2,
+    execId: "exec-read",
+    toolName: "read_file",
+    path: "/tmp/foo.txt",
+  });
+
+  const ok = m.sendToolResult(session, "call_read", "file contents", false);
+
+  assert.equal(ok, true);
+  const writes = calls.filter((c) => c.kind === "write");
+  assert.equal(writes.length, 1);
+  const data = (writes[0] as { kind: "write"; data: Buffer }).data;
+  assert.ok(data.includes(Buffer.from("/tmp/foo.txt", "utf8")));
+  assert.ok(data.includes(Buffer.from("file contents", "utf8")));
+  assert.equal(session.pendingToolCalls.has("call_read"), false);
 });
 
 test("CursorSessionManager.sendToolResult returns false when openAIToolCallId not pending", () => {

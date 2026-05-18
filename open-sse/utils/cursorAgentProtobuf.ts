@@ -158,6 +158,7 @@ const FERR_ERROR = 2; // FetchError.error
 
 // Result-message variant discriminators (oneof). field 1 = success/accepted,
 // field 2 = rejected/error. Matches existing RCR_SUCCESS=1 pattern.
+const RES_SUCCESS = 1;
 const RES_REJECTED = 2; // rejected variant for read/write/delete/ls/shell/bg_shell
 
 // McpToolDefinition
@@ -969,6 +970,25 @@ export function encodeExecReadRejected(
 ): Buffer {
   const rejected = encodeMessage(RES_REJECTED, [encodePathRejection(path, reason)]);
   return wrapExecClientMessage(execMsgId, execId, ECM_READ_RESULT, rejected);
+}
+
+export function encodeExecReadResult(
+  execMsgId: number,
+  execId: string,
+  path: string,
+  content: string
+): Buffer {
+  const contentBytes = Buffer.from(content, "utf8");
+  const totalLines = content.length === 0 ? 0 : content.split(/\r\n|\r|\n/).length;
+  const success = encodeMessage(RES_SUCCESS, [
+    encodeString(1, path),
+    encodeString(2, content),
+    encodeUInt32Field(3, totalLines),
+    Buffer.concat([encodeTag(4, WT_VARINT), encodeVarint(contentBytes.length)]),
+    encodeBoolField(6, false),
+    encodeBoolField(8, false),
+  ]);
+  return wrapExecClientMessage(execMsgId, execId, ECM_READ_RESULT, success);
 }
 
 export function encodeExecWriteRejected(
