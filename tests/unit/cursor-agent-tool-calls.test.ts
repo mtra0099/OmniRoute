@@ -321,3 +321,28 @@ test("processFrame converts repeated completed built-in read calls into final te
   const contentChunk = JSON.parse(emitted[1].replace(/^data: /, "").trim());
   assert.equal(contentChunk.choices[0].delta.content, "hello from foo");
 });
+
+test("processFrame extracts read_file content from truncated JSON-ish tool results", () => {
+  const emitted: string[] = [];
+  const ctx = newStreamCtx("auto", (s) => emitted.push(s), [
+    {
+      name: "read_file",
+      argumentsJson: JSON.stringify({ path: "/tmp/foo.txt" }),
+      content: '{"content": "     1|hello from foo", "total_lines": 0, "is_i...',
+    },
+  ]);
+
+  processFrame(buildReadArgsEvent(11, "exec-read-repeat", "/tmp/foo.txt"), ctx, new Set(), {
+    mcpTools: [
+      {
+        name: "read_file",
+        description: "Read a file",
+        inputSchemaBytes: Buffer.alloc(0),
+        toolName: "read_file",
+      },
+    ],
+  });
+
+  assert.equal(ctx.endReason, "turn_ended");
+  assert.equal(ctx.totalText, "hello from foo");
+});

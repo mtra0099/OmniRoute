@@ -1342,7 +1342,10 @@ function encodeProtobufValue(value: unknown): Buffer {
 
 export type ChatMessage = {
   role: "user" | "assistant" | "system" | "tool";
-  content?: string | Array<{ type: string; text?: string }> | null;
+  content?:
+    | string
+    | Array<{ type?: string; text?: string; content?: unknown; output?: unknown }>
+    | null;
   tool_calls?: Array<{
     id: string;
     type?: "function" | string;
@@ -1350,6 +1353,34 @@ export type ChatMessage = {
   }>;
   tool_call_id?: string;
 };
+
+export function messageContentToText(content: ChatMessage["content"]): string {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+  if (!Array.isArray(content)) return "";
+
+  const parts: string[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    if (typeof part.text === "string") {
+      parts.push(part.text);
+      continue;
+    }
+    if (typeof part.output === "string") {
+      parts.push(part.output);
+      continue;
+    }
+    if (typeof part.content === "string") {
+      parts.push(part.content);
+      continue;
+    }
+    if (Array.isArray(part.content)) {
+      const nested = messageContentToText(part.content as ChatMessage["content"]);
+      if (nested) parts.push(nested);
+    }
+  }
+  return parts.filter(Boolean).join("\n");
+}
 
 /**
  * Flatten an OpenAI-shaped message list down to a single user-text string
@@ -1364,29 +1395,19 @@ export type ChatMessage = {
 export function flattenMessages(messages: ChatMessage[]): string {
   if (!Array.isArray(messages) || messages.length === 0) return "";
 
-  const partsToText = (content: ChatMessage["content"]): string => {
-    if (typeof content === "string") return content;
-    if (content == null) return "";
-    if (!Array.isArray(content)) return "";
-    return content
-      .map((p) => (typeof p?.text === "string" ? p.text : ""))
-      .filter(Boolean)
-      .join("\n");
-  };
-
   // System instructions go first as a labeled prefix. (The cursor executor
   // routes system messages through the KV blob channel — see Phase 7 — but
   // this branch is kept for non-cursor callers.)
   const systemTexts = messages
     .filter((m) => m.role === "system")
-    .map((m) => partsToText(m.content))
+    .map((m) => messageContentToText(m.content))
     .filter(Boolean);
 
   const turn = messages.filter((m) => m.role !== "system");
 
   // Single-user-message fast path (no tool_calls, no labels).
   if (turn.length === 1 && turn[0].role === "user" && !turn[0].tool_calls) {
-    const userText = partsToText(turn[0].content);
+    const userText = messageContentToText(turn[0].content);
     return systemTexts.length > 0 ? `${systemTexts.join("\n\n")}\n\n${userText}` : userText;
   }
 
@@ -1394,7 +1415,7 @@ export function flattenMessages(messages: ChatMessage[]): string {
   // and tool results get their own labeled lines.
   const lines: string[] = [];
   for (const m of turn) {
-    const text = partsToText(m.content);
+    const text = messageContentToText(m.content);
     if (m.role === "user") {
       if (text) lines.push(`User: ${text}`);
     } else if (m.role === "assistant") {

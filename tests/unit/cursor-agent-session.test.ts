@@ -68,6 +68,29 @@ test("flattenMessages handles role:'tool' messages", () => {
   assert.match(out, /Tool result \(call_xyz\): sunny, 22C/);
 });
 
+test("flattenMessages handles structured tool result content", () => {
+  const out = flattenMessages([
+    { role: "user", content: "read the file" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: "call_read",
+          type: "function",
+          function: { name: "read_file", arguments: '{"path":"/tmp/foo.txt"}' },
+        },
+      ],
+    },
+    {
+      role: "tool",
+      tool_call_id: "call_read",
+      content: [{ type: "tool_result", content: [{ type: "text", text: "hello from foo" }] }],
+    },
+  ]);
+  assert.match(out, /Tool result \(call_read\): hello from foo/);
+});
+
 test("flattenMessages handles assistant with text + tool_calls in same message", () => {
   const out = flattenMessages([
     { role: "user", content: "do x" },

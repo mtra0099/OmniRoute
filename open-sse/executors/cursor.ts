@@ -31,6 +31,7 @@ import {
   encodeExecWriteShellStdinError,
   encodeExecDiagnosticsResult,
   flattenMessages,
+  messageContentToText,
   openAIToolsToMcpDefs,
   decompressFrame,
   type ChatMessage,
@@ -342,14 +343,6 @@ function normalizeToolArgsJson(value: unknown): string {
 function collectCompletedToolResults(messages: ChatMessage[]): CompletedToolResult[] {
   const callsById = new Map<string, { name: string; argumentsJson: string }>();
   const results: CompletedToolResult[] = [];
-  const partsToText = (content: ChatMessage["content"]): string => {
-    if (typeof content === "string") return content;
-    if (!Array.isArray(content)) return "";
-    return content
-      .map((part) => (typeof part?.text === "string" ? part.text : ""))
-      .filter(Boolean)
-      .join("\n");
-  };
 
   for (const msg of messages) {
     if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
@@ -365,7 +358,7 @@ function collectCompletedToolResults(messages: ChatMessage[]): CompletedToolResu
       if (!call?.name) continue;
       results.push({
         ...call,
-        content: partsToText(msg.content),
+        content: messageContentToText(msg.content),
       });
     }
   }
@@ -400,15 +393,23 @@ function emitCompletedToolResult(ctx: StreamCtx, result: CompletedToolResult): v
 
 function formatCompletedToolResultContent(result: CompletedToolResult): string {
   if (result.name !== "read_file") return result.content;
-  try {
-    const parsed = JSON.parse(result.content) as { content?: unknown };
-    if (typeof parsed.content !== "string") return result.content;
-    return parsed.content
+  const stripHermesLinePrefix = (content: string) =>
+    content
       .split("\n")
       .map((line) => line.replace(/^\s*\d+\|/, ""))
       .join("\n");
+  try {
+    const parsed = JSON.parse(result.content) as { content?: unknown };
+    if (typeof parsed.content !== "string") return result.content;
+    return stripHermesLinePrefix(parsed.content);
   } catch {
-    return result.content;
+    const match = result.content.match(/"content"\s*:\s*"((?:\\.|[^"\\])*)/);
+    if (!match) return result.content;
+    try {
+      return stripHermesLinePrefix(JSON.parse(`"${match[1]}"`));
+    } catch {
+      return stripHermesLinePrefix(match[1]);
+    }
   }
 }
 
