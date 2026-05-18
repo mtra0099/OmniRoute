@@ -245,6 +245,28 @@ test("processFrame doesn't emit tool_calls for the same exec_id twice", () => {
   assert.equal(ctx.toolCalls.length, 1);
 });
 
+test("processFrame converts repeated completed MCP tool calls into final text", () => {
+  const emitted: string[] = [];
+  const ctx = newStreamCtx("auto", (s) => emitted.push(s), [
+    {
+      name: "get_weather",
+      argumentsJson: JSON.stringify({ city: "Paris" }),
+      content: "sunny, 22C",
+    },
+  ]);
+  const payload = buildMcpArgsEvent(1, "exec-repeat", "get_weather", "cursor_call_x", {
+    city: "Paris",
+  });
+
+  processFrame(payload, ctx, new Set());
+
+  assert.equal(ctx.endReason, "turn_ended");
+  assert.equal(ctx.toolCalls.length, 0);
+  assert.equal(ctx.totalText, "sunny, 22C");
+  const contentChunk = JSON.parse(emitted[1].replace(/^data: /, "").trim());
+  assert.equal(contentChunk.choices[0].delta.content, "sunny, 22C");
+});
+
 test("processFrame surfaces Cursor built-in read as a matching OpenAI tool_call", () => {
   const emitted: string[] = [];
   const ctx = newStreamCtx("auto", (s) => emitted.push(s));
@@ -270,4 +292,32 @@ test("processFrame surfaces Cursor built-in read as a matching OpenAI tool_call"
   assert.equal(initChunk.delta?.tool_calls?.[0].function?.name, "read_file");
   const argsChunk = parseChunk(emitted[2]);
   assert.equal(argsChunk.delta?.tool_calls?.[0].function?.arguments, '{"path":"/tmp/foo.txt"}');
+});
+
+test("processFrame converts repeated completed built-in read calls into final text", () => {
+  const emitted: string[] = [];
+  const ctx = newStreamCtx("auto", (s) => emitted.push(s), [
+    {
+      name: "read_file",
+      argumentsJson: JSON.stringify({ path: "/tmp/foo.txt" }),
+      content: "hello from foo",
+    },
+  ]);
+
+  processFrame(buildReadArgsEvent(11, "exec-read-repeat", "/tmp/foo.txt"), ctx, new Set(), {
+    mcpTools: [
+      {
+        name: "read_file",
+        description: "Read a file",
+        inputSchemaBytes: Buffer.alloc(0),
+        toolName: "read_file",
+      },
+    ],
+  });
+
+  assert.equal(ctx.endReason, "turn_ended");
+  assert.equal(ctx.toolCalls.length, 0);
+  assert.equal(ctx.totalText, "hello from foo");
+  const contentChunk = JSON.parse(emitted[1].replace(/^data: /, "").trim());
+  assert.equal(contentChunk.choices[0].delta.content, "hello from foo");
 });

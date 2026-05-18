@@ -319,9 +319,90 @@ export type StreamCtx = {
   // role:"tool" message can be answered on the open h2 stream via
   // encodeExecMcpResult.
   pendingToolCalls: Map<string, CursorPendingToolCall>;
+  completedToolResults: CompletedToolResult[];
 };
 
-export function newStreamCtx(model: string, emit: (chunk: string) => void): StreamCtx {
+type CompletedToolResult = {
+  name: string;
+  argumentsJson: string;
+  content: string;
+};
+
+function normalizeToolArgsJson(value: unknown): string {
+  if (typeof value === "string") {
+    try {
+      return JSON.stringify(JSON.parse(value));
+    } catch {
+      return value;
+    }
+  }
+  return JSON.stringify(value ?? {});
+}
+
+function collectCompletedToolResults(messages: ChatMessage[]): CompletedToolResult[] {
+  const callsById = new Map<string, { name: string; argumentsJson: string }>();
+  const results: CompletedToolResult[] = [];
+  const partsToText = (content: ChatMessage["content"]): string => {
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content
+      .map((part) => (typeof part?.text === "string" ? part.text : ""))
+      .filter(Boolean)
+      .join("\n");
+  };
+
+  for (const msg of messages) {
+    if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        if (!tc.id || (tc.type && tc.type !== "function")) continue;
+        callsById.set(tc.id, {
+          name: tc.function?.name ?? "",
+          argumentsJson: normalizeToolArgsJson(tc.function?.arguments ?? "{}"),
+        });
+      }
+    } else if (msg.role === "tool" && msg.tool_call_id) {
+      const call = callsById.get(msg.tool_call_id);
+      if (!call?.name) continue;
+      results.push({
+        ...call,
+        content: partsToText(msg.content),
+      });
+    }
+  }
+
+  return results;
+}
+
+function findCompletedToolResult(
+  ctx: StreamCtx,
+  name: string,
+  argumentsJson: string
+): CompletedToolResult | undefined {
+  const normalizedArgs = normalizeToolArgsJson(argumentsJson);
+  for (let i = ctx.completedToolResults.length - 1; i >= 0; i--) {
+    const result = ctx.completedToolResults[i];
+    if (result.name === name && result.argumentsJson === normalizedArgs) return result;
+  }
+  return undefined;
+}
+
+function emitCompletedToolResult(ctx: StreamCtx, result: CompletedToolResult): void {
+  if (!ctx.emittedRoleChunk) {
+    emitChunk(ctx, { role: "assistant", content: "" });
+    ctx.emittedRoleChunk = true;
+  }
+  const content = result.content || "Tool completed.";
+  ctx.totalText += content;
+  ctx.receivedText = true;
+  emitChunk(ctx, { content });
+  ctx.endReason = "turn_ended";
+}
+
+export function newStreamCtx(
+  model: string,
+  emit: (chunk: string) => void,
+  completedToolResults: CompletedToolResult[] = []
+): StreamCtx {
   return {
     responseId: `chatcmpl-cursor-${Date.now()}`,
     created: Math.floor(Date.now() / 1000),
@@ -338,6 +419,7 @@ export function newStreamCtx(model: string, emit: (chunk: string) => void): Stre
     emittedToolCallIndex: 0,
     toolCalls: [],
     pendingToolCalls: new Map(),
+    completedToolResults,
   };
 }
 
@@ -471,13 +553,18 @@ export function processFrame(
       // SSE delta. Two chunks are emitted per call: an init chunk with the
       // tool's id+name+empty args, then a chunk with the JSON-stringified
       // args. Parallel tool calls share one finish chunk (Phase 8 closes).
+      const argumentsJson = JSON.stringify(event.args ?? {});
+      const completed = findCompletedToolResult(ctx, event.toolName, argumentsJson);
+      if (completed) {
+        emitCompletedToolResult(ctx, completed);
+        return;
+      }
       if (!ctx.emittedRoleChunk) {
         emitChunk(ctx, { role: "assistant", content: "" });
         ctx.emittedRoleChunk = true;
       }
       const idx = ctx.emittedToolCallIndex++;
       const openAIToolCallId = generateToolCallId();
-      const argumentsJson = JSON.stringify(event.args ?? {});
       emitChunk(ctx, {
         tool_calls: [
           {
@@ -518,13 +605,18 @@ export function processFrame(
       const toolName = findClientToolNameForBuiltin(event, opts.mcpTools);
       const args = builtinToolArguments(event);
       if (event.kind === "exec_read" && toolName && args) {
+        const argumentsJson = JSON.stringify(args);
+        const completed = findCompletedToolResult(ctx, toolName, argumentsJson);
+        if (completed) {
+          emitCompletedToolResult(ctx, completed);
+          return;
+        }
         if (!ctx.emittedRoleChunk) {
           emitChunk(ctx, { role: "assistant", content: "" });
           ctx.emittedRoleChunk = true;
         }
         const idx = ctx.emittedToolCallIndex++;
         const openAIToolCallId = generateToolCallId();
-        const argumentsJson = JSON.stringify(args);
         emitChunk(ctx, {
           tool_calls: [
             {
@@ -938,7 +1030,9 @@ export class CursorExecutor extends BaseExecutor {
       typeof body.conversation_id === "string" && body.conversation_id
         ? body.conversation_id
         : crypto.randomUUID();
-    const isToolFollowUp = messages.some((msg) => msg.role === "tool");
+    const lastMessage = messages[messages.length - 1];
+    const isToolFollowUp = lastMessage?.role === "tool";
+    const completedToolResults = collectCompletedToolResults(messages);
 
     // Tools embedded in the RequestContext ack throughout the turn —
     // synced with mcp_tools in the encoded request body.
@@ -975,8 +1069,8 @@ export class CursorExecutor extends BaseExecutor {
 
     // ── h2 path with inline session manager (Phase 6) ──
     //
-    // 1. If this is a tool-result follow-up and we have an alive session
-    //    for the conversation or tool_call_id, send the tool
+    // 1. If this is a tool-result follow-up (last message role:"tool") and
+    //    we have an alive session for the conversation or tool_call_id, send the tool
     //    result on the existing h2 stream (inline resume).
     // 2. Otherwise, open a fresh h2 stream, send a new RunRequest, and
     //    register it as a session.
@@ -1097,7 +1191,11 @@ export class CursorExecutor extends BaseExecutor {
       const enc = new TextEncoder();
       const sseStream = new ReadableStream({
         start: async (controller) => {
-          const ctx = newStreamCtx(model, (s) => controller.enqueue(enc.encode(s)));
+          const ctx = newStreamCtx(
+            model,
+            (s) => controller.enqueue(enc.encode(s)),
+            completedToolResults
+          );
           try {
             await this.driveH2(h2, ctx, mcpTools, blobStore, signal);
             this.finalizeSseStream(ctx, body);
@@ -1135,7 +1233,7 @@ export class CursorExecutor extends BaseExecutor {
     }
 
     // Non-streaming: drive to completion, return chat.completion JSON.
-    const ctx = newStreamCtx(model, () => {});
+    const ctx = newStreamCtx(model, () => {}, completedToolResults);
     try {
       await this.driveH2(h2, ctx, mcpTools, blobStore, signal);
     } catch (err) {
