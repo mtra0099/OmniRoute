@@ -47,9 +47,73 @@ import { getCursorVersion } from "../utils/cursorVersionDetector.ts";
 import { sanitizeErrorMessage } from "../utils/error.ts";
 import { generateToolCallId } from "../translator/helpers/toolCallHelper.ts";
 import { cursorSessionManager, type CursorSession } from "../services/cursorSessionManager.ts";
+import {
+  isCreditsExhausted,
+  isAccountDeactivated,
+  isOAuthInvalidToken,
+} from "../services/accountFallback.ts";
+import { updateProviderConnection } from "@/models";
 import crypto from "crypto";
 import * as fs from "node:fs";
 import * as zlib from "node:zlib";
+
+/**
+ * Multi-account auto-switch (Issue #N/A — local fix).
+ *
+ * Mark a Cursor connection as inactive when its account hits a permanent
+ * failure (credits exhausted, deactivated, OAuth invalid). The connection
+ * selector loads via getProviderConnections({ isActive: true }), so flipping
+ * isActive→false makes the next request route to a different active Cursor
+ * account automatically. Fire-and-forget; failures are swallowed because the
+ * primary response to the client must still be sent regardless of whether
+ * the DB write lands cleanly.
+ *
+ * Note: this is the contained alternative to wiring the cursor executor into
+ * the full accountFallback subsystem (applyErrorState/getAccountHealth),
+ * which is built but never plumbed into runtime paths.
+ */
+function disableConnectionOnCriticalError(
+  credentials: { connectionId?: string } | null | undefined,
+  status: number,
+  errorText: string | null
+): void {
+  const connectionId = credentials?.connectionId;
+  if (!connectionId || !errorText) return;
+
+  let testStatus: string | null = null;
+  if (isCreditsExhausted(errorText) || status === HTTP_STATUS.PAYMENT_REQUIRED) {
+    testStatus = "exhausted";
+  } else if (isAccountDeactivated(errorText)) {
+    testStatus = "deactivated";
+  } else if (
+    isOAuthInvalidToken(errorText) ||
+    status === HTTP_STATUS.UNAUTHORIZED ||
+    status === HTTP_STATUS.FORBIDDEN
+  ) {
+    testStatus = "auth_required";
+  }
+  if (!testStatus) return;
+
+  // Fire-and-forget. The client's response is already being assembled; we
+  // don't want a DB hiccup to break that.
+  void updateProviderConnection(connectionId, {
+    isActive: false,
+    testStatus,
+    lastError: {
+      status,
+      message: errorText.slice(0, 500),
+      timestamp: new Date().toISOString(),
+      reason: testStatus,
+    },
+  }).catch((err) => {
+    console.warn(
+      `[CURSOR-DISABLE] failed to disable connection ${connectionId} (${testStatus}): ${(err as Error).message}`
+    );
+  });
+  console.warn(
+    `[CURSOR-DISABLE] connection ${connectionId} marked ${testStatus} (status=${status}): ${errorText.slice(0, 200)}`
+  );
+}
 
 // Reject reason text aligned with kaitranntt/CLIProxyAPIPlus — proven to
 // keep cursor's model from retrying the same built-in tool indefinitely.
@@ -928,6 +992,10 @@ export class CursorExecutor extends BaseExecutor {
       if (opened.status !== 200) {
         const errBuf = await opened.consumeError();
         const errText = errBuf.toString("utf8") || "Unknown error";
+        // Auto-disable the connection if the upstream HTTP error indicates
+        // credits exhausted / account deactivated / OAuth invalid, so the
+        // next request routes to a different active Cursor account.
+        disableConnectionOnCriticalError(credentials, opened.status, errText);
         return {
           response: buildErrorResponse(opened.status, `[${opened.status}]: ${errText}`),
           url,
@@ -962,6 +1030,16 @@ export class CursorExecutor extends BaseExecutor {
           try {
             await this.driveH2(h2, ctx, mcpTools, blobStore, signal);
             this.finalizeSseStream(ctx, body);
+            // If Cursor returned a Connect-RPC JSON error (e.g. credits
+            // exhausted), tear down this account so the next request hits a
+            // different one. ctx.midStreamError carries the classification.
+            if (ctx.midStreamError) {
+              disableConnectionOnCriticalError(
+                credentials,
+                ctx.midStreamError.status,
+                ctx.midStreamError.message
+              );
+            }
             finishLifecycle(ctx, false);
             controller.close();
           } catch (err) {
@@ -1000,6 +1078,13 @@ export class CursorExecutor extends BaseExecutor {
       };
     }
     finishLifecycle(ctx, false);
+    if (ctx.midStreamError) {
+      disableConnectionOnCriticalError(
+        credentials,
+        ctx.midStreamError.status,
+        ctx.midStreamError.message
+      );
+    }
     return {
       response: this.buildResponseFromCtx(ctx, body),
       url,
