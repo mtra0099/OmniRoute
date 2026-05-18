@@ -32,6 +32,7 @@ import {
   encodeExecDiagnosticsResult,
   flattenMessages,
   openAIToolsToMcpDefs,
+  decompressFrame,
   type ChatMessage,
   type ExecServerEvent,
   type McpToolDefinition,
@@ -757,14 +758,25 @@ export class CursorExecutor extends BaseExecutor {
           if (pos + 5 + length > buf.length) break; // partial frame; wait
           const flag = buf[pos];
           const raw = buf.subarray(pos + 5, pos + 5 + length);
-          // Per-frame error isolation: if gunzip or processFrame throws on
-          // one frame, log and skip past it instead of getting stuck on
+          // Per-frame error isolation: if decompression or processFrame throws
+          // on one frame, log and skip past it instead of getting stuck on
           // the same offset and hanging until the safety timer fires.
+          //
+          // Cursor compresses with gzip (flag=0x01) for most frames but uses
+          // zlib-deflate for some tool_use response frames (flag=0x02/0x03).
+          // decompressFrame tries gunzip → inflate → inflateRaw so those
+          // frames don't get silently dropped (regression of fix #250).
           try {
-            const payload = flag & 0x1 ? zlib.gunzipSync(raw) : raw;
+            const payload = decompressFrame(raw, flag);
             processFrame(payload, ctx, ackedExecIds, { h2Req: h2.req, mcpTools, blobStore });
           } catch (err) {
-            debugLog("[cursor-agent] frame decode failed at pos", pos, ":", (err as Error).message);
+            // Use console.warn (not debugLog) so failures surface without
+            // requiring CURSOR_DEBUG=1. Include flag hex + length so we can
+            // tell whether it's a decompression issue or a downstream parse
+            // issue when frames go missing.
+            console.warn(
+              `[CURSOR-FRAME] decode failed pos=${pos} flag=0x${flag.toString(16)} len=${length}: ${(err as Error).message}`
+            );
           }
           pos += 5 + length;
           if (ctx.endReason) {

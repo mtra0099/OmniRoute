@@ -308,6 +308,37 @@ export function wrapConnectFrame(payload: Buffer, compressed = false): Buffer {
   return Buffer.concat([header, data]);
 }
 
+/**
+ * Decompress a Connect-RPC frame body across the algorithms Cursor has been
+ * observed to use. flag=0x01 is gzip, but tool_use response frames have been
+ * seen with flag=0x02/0x03 carrying zlib-deflate or raw-deflate payloads.
+ * Issue #250 added an inflate fallback that was later lost during refactors,
+ * causing tool calls to be silently dropped. This helper restores it and
+ * includes the actual flag in error messages so failures are diagnosable.
+ */
+export function decompressFrame(raw: Buffer, flag: number): Buffer {
+  if (flag === FLAG_NONE) return raw;
+  const errs: string[] = [];
+  try {
+    return zlib.gunzipSync(raw);
+  } catch (e) {
+    errs.push(`gunzip: ${(e as Error).message}`);
+  }
+  try {
+    return zlib.inflateSync(raw);
+  } catch (e) {
+    errs.push(`inflate: ${(e as Error).message}`);
+  }
+  try {
+    return zlib.inflateRawSync(raw);
+  } catch (e) {
+    errs.push(`inflateRaw: ${(e as Error).message}`);
+  }
+  throw new Error(
+    `cursor frame decompression failed for flag=0x${flag.toString(16)} (len=${raw.length}): ${errs.join("; ")}`
+  );
+}
+
 export type ConnectFrame = {
   flags: number;
   payload: Buffer;
@@ -320,7 +351,7 @@ export function* iterateConnectFrames(stream: Buffer): Generator<ConnectFrame> {
     const length = stream.readUInt32BE(pos + 1);
     if (pos + 5 + length > stream.length) return;
     const raw = stream.subarray(pos + 5, pos + 5 + length);
-    const payload = flags & FLAG_GZIP ? zlib.gunzipSync(raw) : raw;
+    const payload = decompressFrame(raw, flags);
     yield { flags, payload };
     pos += 5 + length;
   }
