@@ -1100,6 +1100,31 @@ test("markAccountUnavailable reuses an existing connection-wide cooldown", async
   assert.equal(updated.rateLimitedUntil, retryAfter);
 });
 
+test("markAccountUnavailable applies a longer cooldown for Cursor early EOF", async () => {
+  const connection = await seedConnection("cursor", {
+    authType: "oauth",
+    name: "cursor-early-eof",
+    email: "cursor-early-eof@example.com",
+    apiKey: null,
+    accessToken: "cursor-token",
+  });
+
+  const result = await auth.markAccountUnavailable(
+    connection.id,
+    502,
+    "Stream ended before producing useful content",
+    "cursor",
+    "cu/claude-opus-4-7-thinking-high"
+  );
+  const updated = await providersDb.getProviderConnectionById(connection.id);
+
+  assert.equal(result.shouldFallback, true);
+  assert.ok(result.cooldownMs >= 59_000);
+  assert.equal(updated.testStatus, "unavailable");
+  assert.equal(Number(updated.errorCode), 502);
+  assert.ok(msUntil(updated.rateLimitedUntil) >= 59_000);
+});
+
 test("markAccountUnavailable reuses an existing Codex scope cooldown", async () => {
   const retryAfter = futureIso(90_000);
   const connection = await seedConnection("codex", {

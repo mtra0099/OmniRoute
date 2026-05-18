@@ -746,6 +746,16 @@ let selectionMutex = Promise.resolve();
 // unavailable in parallel, which was the root cause of cascading 502 lockouts.
 const markMutexes = new Map<string, Promise<void>>();
 
+const CURSOR_EARLY_EOF_MIN_COOLDOWN_MS = 60 * 1000;
+
+function isCursorEarlyEof(status: number, errorText: string, provider: string | null) {
+  return (
+    provider === "cursor" &&
+    status === 502 &&
+    /stream ended before producing useful content/i.test(errorText)
+  );
+}
+
 // Strict-Random shuffle deck moved to src/shared/utils/shuffleDeck.ts
 // auth.ts uses getNextFromDeckSync (already inside selectionMutex).
 // Re-export for backwards compat with existing test imports.
@@ -1598,9 +1608,12 @@ export async function markAccountUnavailable(
       return { shouldFallback: true, cooldownMs: lockout.cooldownMs };
     }
     const result = fallbackResult;
-    const { shouldFallback, cooldownMs: rawCooldownMs, newBackoffLevel, reason } = result;
+    const { shouldFallback, newBackoffLevel, reason } = result;
     if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
     const providerErrorType = classifyProviderError(status, errorText, provider);
+    const rawCooldownMs = isCursorEarlyEof(status, errorText, provider)
+      ? Math.max(result.cooldownMs, CURSOR_EARLY_EOF_MIN_COOLDOWN_MS)
+      : result.cooldownMs;
 
     if (provider && resolveProviderId(provider) === "grok-web" && status === 403 && model) {
       const lockout = recordModelLockoutFailure(
