@@ -276,6 +276,9 @@ export type StreamCtx = {
   thinkingText: string;
   tokenDelta: number;
   // End-signal tracking (Phase 8 hardens this further).
+  // Actionable assistant text only. Reasoning/thinking deltas are not enough
+  // to treat Cursor's KV save frame as an end-of-response marker because
+  // thinking models can emit KV traffic before the later text/tool_call frame.
   receivedText: boolean;
   kvAfterTextSeen: boolean;
   endReason: "turn_ended" | "kv_after_text" | "tool_calls" | "server_end" | null;
@@ -524,7 +527,6 @@ export function processFrame(
         ctx.emittedRoleChunk = true;
       }
       ctx.thinkingText += d.text;
-      ctx.receivedText = true;
       emitChunk(ctx, { reasoning_content: d.text });
     } else if (d.kind === "token_delta") {
       ctx.tokenDelta += d.tokens;

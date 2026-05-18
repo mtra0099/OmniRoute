@@ -132,6 +132,28 @@ test("processFrame ignores kv_server_message before text (no end signal yet)", (
   assert.equal(ctx.kvAfterTextSeen, false);
 });
 
+test("processFrame ignores kv_server_message after thinking-only deltas", () => {
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(buildThinkingDeltaPayload("checking the filesystem"), ctx, new Set());
+  processFrame(buildKvServerMessagePayload(), ctx, new Set());
+
+  assert.equal(ctx.thinkingText, "checking the filesystem");
+  assert.equal(ctx.receivedText, false);
+  assert.equal(ctx.endReason, null);
+  assert.equal(ctx.kvAfterTextSeen, false);
+});
+
+test("processFrame still treats kv_server_message after content as an end signal", () => {
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(buildThinkingDeltaPayload("brief reasoning"), ctx, new Set());
+  processFrame(buildTextDeltaPayload("answer"), ctx, new Set());
+  processFrame(buildKvServerMessagePayload(), ctx, new Set());
+
+  assert.equal(ctx.receivedText, true);
+  assert.equal(ctx.endReason, "kv_after_text");
+  assert.equal(ctx.kvAfterTextSeen, true);
+});
+
 test("processFrame captures mid-stream JSON error", () => {
   const ctx = newStreamCtx("auto", () => {});
   processFrame(buildJsonErrorPayload(), ctx, new Set());
@@ -193,7 +215,7 @@ test("processFrame accumulates thinking_delta into thinkingText and emits reason
   processFrame(buildThinkingDeltaPayload("step 1: "), ctx, new Set());
   processFrame(buildThinkingDeltaPayload("compute"), ctx, new Set());
   assert.equal(ctx.thinkingText, "step 1: compute");
-  assert.equal(ctx.receivedText, true);
+  assert.equal(ctx.receivedText, false);
   // role chunk + 2 reasoning_content chunks
   assert.equal(emitted.length, 3);
   const chunks = emitted.map((s) => JSON.parse(s.replace(/^data: /, "").trim()));
