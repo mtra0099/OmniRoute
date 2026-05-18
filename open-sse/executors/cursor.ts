@@ -391,11 +391,25 @@ function emitCompletedToolResult(ctx: StreamCtx, result: CompletedToolResult): v
     emitChunk(ctx, { role: "assistant", content: "" });
     ctx.emittedRoleChunk = true;
   }
-  const content = result.content || "Tool completed.";
+  const content = formatCompletedToolResultContent(result) || "Tool completed.";
   ctx.totalText += content;
   ctx.receivedText = true;
   emitChunk(ctx, { content });
   ctx.endReason = "turn_ended";
+}
+
+function formatCompletedToolResultContent(result: CompletedToolResult): string {
+  if (result.name !== "read_file") return result.content;
+  try {
+    const parsed = JSON.parse(result.content) as { content?: unknown };
+    if (typeof parsed.content !== "string") return result.content;
+    return parsed.content
+      .split("\n")
+      .map((line) => line.replace(/^\s*\d+\|/, ""))
+      .join("\n");
+  } catch {
+    return result.content;
+  }
 }
 
 export function newStreamCtx(
@@ -1032,6 +1046,7 @@ export class CursorExecutor extends BaseExecutor {
         : crypto.randomUUID();
     const lastMessage = messages[messages.length - 1];
     const isToolFollowUp = lastMessage?.role === "tool";
+    const useInlineToolFollowUp = isToolFollowUp && !model.toLowerCase().includes("grok");
     const completedToolResults = collectCompletedToolResults(messages);
 
     // Tools embedded in the RequestContext ack throughout the turn —
@@ -1090,7 +1105,7 @@ export class CursorExecutor extends BaseExecutor {
     let h2: H2Like;
     let blobStore: Map<string, Buffer>;
 
-    if (isToolFollowUp) {
+    if (useInlineToolFollowUp) {
       session = cursorSessionManager.acquire(conversationId);
       if (!session) {
         for (const msg of messages) {

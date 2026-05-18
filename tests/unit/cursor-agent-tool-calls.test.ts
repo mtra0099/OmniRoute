@@ -300,7 +300,7 @@ test("processFrame converts repeated completed built-in read calls into final te
     {
       name: "read_file",
       argumentsJson: JSON.stringify({ path: "/tmp/foo.txt" }),
-      content: "hello from foo",
+      content: JSON.stringify({ content: "     1|hello from foo", total_lines: 1 }),
     },
   ]);
 
