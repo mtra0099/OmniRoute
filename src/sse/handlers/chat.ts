@@ -955,6 +955,18 @@ async function handleSingleModelChat(
         provider === "cursor" &&
         !hasForcedConnection
       ) {
+        const { cooldownMs } = await markAccountUnavailable(
+          credentials.connectionId,
+          result.status,
+          result.error,
+          provider,
+          model,
+          providerProfile
+        );
+        if (Number.isFinite(cooldownMs) && cooldownMs > 0) {
+          lastCooldownMs = cooldownMs;
+          requestRetryLastCooldownMs = cooldownMs;
+        }
         log.warn(
           "AUTH",
           `Cursor account ${accountId}... ended before useful content; trying fallback account`
