@@ -112,15 +112,47 @@ test("decodeExecServerEvent recognizes ls_args (field 8)", () => {
   assert.deepEqual(event, { kind: "exec_ls", execMsgId: 5, execId: "exec-l", path: "/home" });
 });
 
-test("decodeExecServerEvent recognizes grep_args (field 5)", () => {
-  const variant = stringField(1, "pattern");
+test("decodeExecServerEvent recognizes grep_args (field 5) — content search", () => {
+  // Wire shape captured on cu/composer-2 when the user asked to grep for a
+  // string: pattern (1), path (2), and optional include/output_mode (3/4).
+  const variant = Buffer.concat([
+    stringField(1, "needle"),
+    stringField(2, "/tmp/scope"),
+    stringField(3, "*.md"),
+    stringField(4, "content"),
+  ]);
   const esm = buildExecServerMessage(6, "exec-g", 5, variant);
   const event = decodeExecServerEvent(buildAgentServerMessage(esm));
   assert.deepEqual(event, {
     kind: "exec_grep",
     execMsgId: 6,
     execId: "exec-g",
-    pattern: "pattern",
+    pattern: "needle",
+    path: "/tmp/scope",
+    include: "*.md",
+    outputMode: "content",
+  });
+});
+
+test("decodeExecServerEvent recognizes grep_args — filename-only search (no pattern)", () => {
+  // Composer-2 sends ONLY the include glob (field 3) when the user wants a
+  // filename search ("find files named *baz*"). Field 1 is omitted entirely;
+  // the executor uses this shape to dispatch onto the client's glob tool.
+  const variant = Buffer.concat([
+    stringField(2, "/tmp/scope"),
+    stringField(3, "**/*baz*"),
+    stringField(4, "files_with_matches"),
+  ]);
+  const esm = buildExecServerMessage(7, "exec-glob", 5, variant);
+  const event = decodeExecServerEvent(buildAgentServerMessage(esm));
+  assert.deepEqual(event, {
+    kind: "exec_grep",
+    execMsgId: 7,
+    execId: "exec-glob",
+    pattern: "",
+    path: "/tmp/scope",
+    include: "**/*baz*",
+    outputMode: "files_with_matches",
   });
 });
 

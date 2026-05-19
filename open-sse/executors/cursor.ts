@@ -236,15 +236,29 @@ type ClientToolSchema = {
 // Candidate client tool names per cursor exec kind, ordered by preference.
 // Hermes uses snake_case names like "read_file"; opencode uses short names
 // like "read"; we accept either (and a few capitalization variants).
+//
+// exec_ls intentionally has no glob fallback: opencode's glob requires a
+// pattern, but a plain `ls` carries only a path. Mapping ls→glob with an
+// empty pattern produces an immediate "pattern is required" rejection on
+// the client side and a tight retry loop. Returning null from the mapping
+// instead lets the cursor executor send a typed rejection so the model
+// picks a different tool (read / bash / declared MCP).
 const BUILTIN_TOOL_CANDIDATES: Partial<Record<ExecServerEvent["kind"], string[]>> = {
   exec_read: ["read_file", "readFile", "read", "Read"],
   exec_write: ["write_file", "writeFile", "write", "Write"],
-  exec_ls: ["list_directory", "list_dir", "list", "ls", "Ls", "glob"],
+  exec_ls: ["list_directory", "list_dir", "list", "ls", "Ls"],
   exec_grep: ["grep", "ripgrep", "search", "Grep"],
   exec_shell: ["bash", "shell", "run_command", "Bash", "execute"],
   exec_shell_stream: ["bash", "shell", "run_command", "Bash", "execute"],
   exec_bg_shell: ["bash", "shell", "run_command", "Bash", "execute"],
 };
+
+// Cursor's GrepArgs (variant 5) carries BOTH content search (regex in field 1)
+// AND filename search (glob in field 3) — composer-2 omits field 1 entirely
+// when the user just wants to find files by name. Filename-only calls must be
+// routed onto the client's `glob` tool because opencode's grep requires a
+// non-empty pattern and would reject the call otherwise.
+const GLOB_TOOL_CANDIDATES = ["glob", "find_files", "Glob"];
 
 // Candidate parameter names per logical concept. We probe the client tool's
 // schema for each candidate and use the first match. The "native" name
@@ -256,6 +270,7 @@ const PARAM_CANDIDATES: Record<string, { native: string; aliases: string[] }> = 
   content: { native: "content", aliases: ["fileText", "file_text", "text", "body", "newContent"] },
   command: { native: "command", aliases: ["cmd", "shell_command", "script"] },
   pattern: { native: "pattern", aliases: ["query", "regex", "search"] },
+  include: { native: "include", aliases: ["glob", "filter", "files"] },
   description: { native: "description", aliases: ["purpose", "intent", "explanation"] },
 };
 
@@ -305,10 +320,42 @@ function mapBuiltinToClientTool(
   rawTools: OpenAITool[] | undefined,
   mcpTools: McpToolDefinition[] | undefined
 ): BuiltinToolMapping | null {
+  const names = new Set((mcpTools ?? []).map((t) => t.toolName || t.name));
+
+  // exec_grep is bimodal: cursor sends the same wire variant for content
+  // search (pattern set) and pure filename search (only include set).
+  // Composer-2 prefers the filename-search shape for "find file X" requests;
+  // routing that to grep with an empty pattern surfaces opencode's
+  // "pattern is required" rejection on every call. Dispatch filename-only
+  // searches to the glob tool and content searches to grep.
+  if (event.kind === "exec_grep") {
+    const hasPattern = event.pattern.length > 0;
+    const hasInclude = event.include.length > 0;
+    const isFilenameOnly = !hasPattern && hasInclude;
+    const grepCandidates = BUILTIN_TOOL_CANDIDATES.exec_grep ?? [];
+    const candidates = isFilenameOnly ? GLOB_TOOL_CANDIDATES : grepCandidates;
+    const toolName = candidates.find((name) => names.has(name));
+    if (!toolName) return null;
+
+    const schema = findClientToolSchema(toolName, rawTools);
+    const args: Record<string, unknown> = {};
+    if (isFilenameOnly) {
+      // Cursor's `include` field carries the glob query; opencode's glob
+      // expects it under `pattern`. The cursor `path` field becomes the
+      // search scope.
+      mapParam(schema, "pattern", args, event.include);
+      if (event.path) mapParam(schema, "path", args, event.path);
+    } else {
+      mapParam(schema, "pattern", args, event.pattern);
+      if (event.path) mapParam(schema, "path", args, event.path);
+      if (event.include) mapParam(schema, "include", args, event.include);
+    }
+    return { toolName, args };
+  }
+
   const candidates = BUILTIN_TOOL_CANDIDATES[event.kind];
   if (!candidates) return null;
 
-  const names = new Set((mcpTools ?? []).map((t) => t.toolName || t.name));
   const toolName = candidates.find((name) => names.has(name));
   if (!toolName) return null;
 
@@ -324,9 +371,6 @@ function mapBuiltinToClientTool(
     case "exec_write":
       mapParam(schema, "path", args, event.path);
       mapParam(schema, "content", args, event.content);
-      break;
-    case "exec_grep":
-      mapParam(schema, "pattern", args, event.pattern);
       break;
     case "exec_shell":
     case "exec_shell_stream":

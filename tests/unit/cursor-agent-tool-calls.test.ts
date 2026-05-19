@@ -109,6 +109,31 @@ function buildShellArgsEvent(
   return lenPrefixed(2, esm);
 }
 
+// GrepArgs (ESM variant 5) with the four schema fields wire-tapped from
+// cu/composer-2: pattern (1), path (2), include (3), output_mode (4).
+// Pass empty strings for the fields composer-2 omits in a given call shape.
+function buildGrepArgsEvent(
+  execMsgId: number,
+  execId: string,
+  pattern: string,
+  path: string,
+  include: string,
+  outputMode: string
+): Buffer {
+  const grepArgs = Buffer.concat([
+    pattern ? stringField(1, pattern) : Buffer.alloc(0),
+    path ? stringField(2, path) : Buffer.alloc(0),
+    include ? stringField(3, include) : Buffer.alloc(0),
+    outputMode ? stringField(4, outputMode) : Buffer.alloc(0),
+  ]);
+  const esm = Buffer.concat([
+    varintField(1, execMsgId),
+    stringField(15, execId),
+    lenPrefixed(5, grepArgs), // ESM_GREP_ARGS = 5
+  ]);
+  return lenPrefixed(2, esm);
+}
+
 // ─── decodeProtobufValue round-trip tests ──────────────────────────────────
 
 test("decodeProtobufValue round-trips primitives", () => {
@@ -528,6 +553,200 @@ test("processFrame extracts read_file content from truncated JSON-ish tool resul
 
   assert.equal(ctx.endReason, "turn_ended");
   assert.equal(ctx.totalText, "hello from foo");
+});
+
+// ─── exec_grep dispatch: content-search vs filename-only glob ──────────────
+//
+// Cursor's GrepArgs variant 5 carries both content search (pattern at field 1)
+// and pure filename search (include glob at field 3 with no pattern). The
+// executor must route the second case to the client's glob tool, otherwise
+// opencode's grep rejects every call with "pattern is required" and the
+// agent loops forever.
+
+test("processFrame routes exec_grep with pattern → opencode grep with {pattern,path,include}", () => {
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(
+    buildGrepArgsEvent(20, "exec-grep-1", "needle", "/tmp/scope", "*.md", "content"),
+    ctx,
+    new Set(),
+    {
+      mcpTools: [
+        {
+          name: "grep",
+          description: "Grep",
+          inputSchemaBytes: Buffer.alloc(0),
+          toolName: "grep",
+        },
+      ],
+      rawTools: [
+        {
+          type: "function",
+          function: {
+            name: "grep",
+            parameters: {
+              type: "object",
+              properties: {
+                pattern: { type: "string" },
+                path: { type: "string" },
+                include: { type: "string" },
+              },
+              required: ["pattern"],
+            },
+          },
+        },
+      ],
+    }
+  );
+  assert.equal(ctx.toolCalls.length, 1);
+  assert.equal(ctx.toolCalls[0].name, "grep");
+  const args = JSON.parse(ctx.toolCalls[0].argumentsJson);
+  assert.equal(args.pattern, "needle");
+  assert.equal(args.path, "/tmp/scope");
+  assert.equal(args.include, "*.md");
+});
+
+test("processFrame routes exec_grep with only include → opencode glob with {pattern,path}", () => {
+  // The bug from CLAUDE_CURSOR_GREP_GOAL: composer-2 asks for filenames
+  // matching a glob; cursor sends GrepArgs with pattern omitted and the glob
+  // at field 3. Pre-fix the executor routed this to opencode's grep with an
+  // empty pattern; opencode rejected every call with "pattern is required".
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(
+    buildGrepArgsEvent(21, "exec-glob-1", "", "/tmp/scope", "**/*weather*", "files_with_matches"),
+    ctx,
+    new Set(),
+    {
+      mcpTools: [
+        {
+          name: "glob",
+          description: "Glob",
+          inputSchemaBytes: Buffer.alloc(0),
+          toolName: "glob",
+        },
+        {
+          name: "grep",
+          description: "Grep",
+          inputSchemaBytes: Buffer.alloc(0),
+          toolName: "grep",
+        },
+      ],
+      rawTools: [
+        {
+          type: "function",
+          function: {
+            name: "glob",
+            parameters: {
+              type: "object",
+              properties: { pattern: { type: "string" }, path: { type: "string" } },
+              required: ["pattern"],
+            },
+          },
+        },
+        {
+          type: "function",
+          function: {
+            name: "grep",
+            parameters: {
+              type: "object",
+              properties: {
+                pattern: { type: "string" },
+                path: { type: "string" },
+                include: { type: "string" },
+              },
+              required: ["pattern"],
+            },
+          },
+        },
+      ],
+    }
+  );
+  assert.equal(ctx.toolCalls.length, 1);
+  assert.equal(ctx.toolCalls[0].name, "glob");
+  const args = JSON.parse(ctx.toolCalls[0].argumentsJson);
+  assert.equal(args.pattern, "**/*weather*");
+  assert.equal(args.path, "/tmp/scope");
+  // No `include` — opencode's glob schema has no such field.
+  assert.equal(args.include, undefined);
+});
+
+test("processFrame falls back to cursor native arg names for grep when no schema is given", () => {
+  // Hermes / no-schema callers must still see cursor's native arg names so
+  // legacy flows don't regress.
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(
+    buildGrepArgsEvent(22, "exec-grep-hermes", "needle", "/tmp/scope", "*.md", "content"),
+    ctx,
+    new Set(),
+    {
+      mcpTools: [
+        {
+          name: "grep",
+          description: "Grep",
+          inputSchemaBytes: Buffer.alloc(0),
+          toolName: "grep",
+        },
+      ],
+      // rawTools intentionally omitted
+    }
+  );
+  assert.equal(ctx.toolCalls.length, 1);
+  const args = JSON.parse(ctx.toolCalls[0].argumentsJson);
+  // Native field names from cursor — `pattern`/`path`/`include` happen to
+  // match opencode's too, but the assertion is that with no schema we use
+  // cursor's native names regardless of what the client tool turns out to use.
+  assert.equal(args.pattern, "needle");
+  assert.equal(args.path, "/tmp/scope");
+  assert.equal(args.include, "*.md");
+});
+
+test("processFrame rejects exec_ls when the client has no listing tool (no glob fallback)", () => {
+  // opencode declares glob but it requires a non-empty pattern. Mapping
+  // exec_ls → glob with an empty pattern caused a "pattern is required" loop
+  // before the fix; now exec_ls produces a typed rejection instead so the
+  // model moves on to a tool that can do the job.
+  function buildLsArgsEvent(execMsgId: number, execId: string, path: string): Buffer {
+    const lsArgs = stringField(1, path);
+    const esm = Buffer.concat([
+      varintField(1, execMsgId),
+      stringField(15, execId),
+      lenPrefixed(8, lsArgs), // ESM_LS_ARGS = 8
+    ]);
+    return lenPrefixed(2, esm);
+  }
+  const ctx = newStreamCtx("auto", () => {});
+  // Fake h2 write target — just captures writes for inspection.
+  const writes: Buffer[] = [];
+  const fakeReq = { write: (b: Buffer) => writes.push(b) } as unknown as Parameters<
+    typeof processFrame
+  >[3]["h2Req"];
+  processFrame(buildLsArgsEvent(30, "exec-ls", "/home/user"), ctx, new Set(), {
+    h2Req: fakeReq,
+    mcpTools: [
+      {
+        name: "glob",
+        description: "Glob",
+        inputSchemaBytes: Buffer.alloc(0),
+        toolName: "glob",
+      },
+    ],
+    rawTools: [
+      {
+        type: "function",
+        function: {
+          name: "glob",
+          parameters: {
+            type: "object",
+            properties: { pattern: { type: "string" }, path: { type: "string" } },
+            required: ["pattern"],
+          },
+        },
+      },
+    ],
+  });
+  // No tool call emitted — we wrote a rejection instead, so the model can
+  // pick a different approach.
+  assert.equal(ctx.toolCalls.length, 0);
+  assert.ok(writes.length > 0, "expected ls rejection to be written back");
 });
 
 test("collectCompletedToolResults handles cursor-translated tool result blocks", () => {

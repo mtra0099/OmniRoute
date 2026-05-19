@@ -761,7 +761,28 @@ export type ExecServerEvent =
   | { kind: "exec_write"; execMsgId: number; execId: string; path: string; content: string }
   | { kind: "exec_delete"; execMsgId: number; execId: string; path: string }
   | { kind: "exec_ls"; execMsgId: number; execId: string; path: string }
-  | { kind: "exec_grep"; execMsgId: number; execId: string; pattern: string }
+  | {
+      kind: "exec_grep";
+      execMsgId: number;
+      execId: string;
+      // Content-search regex (cursor GrepArgs field 1). Empty when cursor is
+      // using grep for filename-only search (the `include` glob carries the
+      // query and `pattern` is omitted) — caller dispatches to glob in that
+      // case. Wire-tap confirmed on cu/composer-2.
+      pattern: string;
+      // Directory to scope the search to (GrepArgs field 2). Empty when
+      // unspecified.
+      path: string;
+      // Glob filter on file names (GrepArgs field 3). For pure filename search
+      // this carries the entire query (e.g. "**/*weather*") while `pattern` is
+      // empty. For mixed content+filename search both are set.
+      include: string;
+      // ripgrep-style output mode (GrepArgs field 4): "content" /
+      // "files_with_matches" / etc. opencode's grep tool has no equivalent
+      // parameter; we expose it for completeness but don't forward to the
+      // client schema.
+      outputMode: string;
+    }
   | { kind: "exec_diagnostics"; execMsgId: number; execId: string }
   | {
       kind: "exec_shell";
@@ -798,8 +819,16 @@ export type ExecServerEvent =
 
 // WriteArgs sub-field for the file content (path is field 1).
 const ARG_WRITE_CONTENT = 2;
-// GrepArgs sub-field for the pattern.
+// GrepArgs sub-fields (verified against on-the-wire cu/composer-2 captures
+// taken May 2026; see commits for ARG_GREP_INCLUDE / ARG_GREP_OUTPUT_MODE
+// rollout). Pattern at field 1 is the content regex; field 3 is a glob filter
+// on file names — composer-2 sends ONLY field 3 (with field 1 omitted) when
+// the user asks for a filename search, so the executor must dispatch those
+// onto the client's `glob` tool instead of `grep`.
 const ARG_GREP_PATTERN = 1;
+const ARG_GREP_PATH = 2;
+const ARG_GREP_INCLUDE = 3;
+const ARG_GREP_OUTPUT_MODE = 4;
 
 export function decodeExecServerEvent(payload: Buffer): ExecServerEvent | null {
   for (const top of decodeFields(payload)) {
@@ -865,6 +894,9 @@ export function decodeExecServerEvent(payload: Buffer): ExecServerEvent | null {
           execMsgId,
           execId,
           pattern: decodeStringField(variantBytes, ARG_GREP_PATTERN),
+          path: decodeStringField(variantBytes, ARG_GREP_PATH),
+          include: decodeStringField(variantBytes, ARG_GREP_INCLUDE),
+          outputMode: decodeStringField(variantBytes, ARG_GREP_OUTPUT_MODE),
         };
       case ESM_DIAGNOSTICS_ARGS:
         return { kind: "exec_diagnostics", execMsgId, execId };
