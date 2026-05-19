@@ -758,10 +758,10 @@ export function decodeKvServerEvent(payload: Buffer): KvServerEvent | null {
 export type ExecServerEvent =
   | { kind: "exec_request_context"; execMsgId: number; execId: string }
   | { kind: "exec_read"; execMsgId: number; execId: string; path: string }
-  | { kind: "exec_write"; execMsgId: number; execId: string; path: string }
+  | { kind: "exec_write"; execMsgId: number; execId: string; path: string; content: string }
   | { kind: "exec_delete"; execMsgId: number; execId: string; path: string }
   | { kind: "exec_ls"; execMsgId: number; execId: string; path: string }
-  | { kind: "exec_grep"; execMsgId: number; execId: string }
+  | { kind: "exec_grep"; execMsgId: number; execId: string; pattern: string }
   | { kind: "exec_diagnostics"; execMsgId: number; execId: string }
   | {
       kind: "exec_shell";
@@ -795,6 +795,11 @@ export type ExecServerEvent =
       // args populated by Phase 5 (decodeMcpArgs); empty {} until then.
       args: Record<string, unknown>;
     };
+
+// WriteArgs sub-field for the file content (path is field 1).
+const ARG_WRITE_CONTENT = 2;
+// GrepArgs sub-field for the pattern.
+const ARG_GREP_PATTERN = 1;
 
 export function decodeExecServerEvent(payload: Buffer): ExecServerEvent | null {
   for (const top of decodeFields(payload)) {
@@ -838,6 +843,7 @@ export function decodeExecServerEvent(payload: Buffer): ExecServerEvent | null {
           execMsgId,
           execId,
           path: decodeStringField(variantBytes, ARG_PATH),
+          content: decodeStringField(variantBytes, ARG_WRITE_CONTENT),
         };
       case ESM_DELETE_ARGS:
         return {
@@ -854,7 +860,12 @@ export function decodeExecServerEvent(payload: Buffer): ExecServerEvent | null {
           path: decodeStringField(variantBytes, ARG_PATH),
         };
       case ESM_GREP_ARGS:
-        return { kind: "exec_grep", execMsgId, execId };
+        return {
+          kind: "exec_grep",
+          execMsgId,
+          execId,
+          pattern: decodeStringField(variantBytes, ARG_GREP_PATTERN),
+        };
       case ESM_DIAGNOSTICS_ARGS:
         return { kind: "exec_diagnostics", execMsgId, execId };
       case ESM_SHELL_ARGS:

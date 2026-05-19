@@ -205,19 +205,144 @@ function buildExecRejection(event: ExecServerEvent): Buffer | null {
   }
 }
 
-function findClientToolNameForBuiltin(
-  event: ExecServerEvent,
-  tools: McpToolDefinition[] | undefined
-): string | null {
-  if (!tools || tools.length === 0) return null;
-  const names = new Set(tools.map((tool) => tool.toolName || tool.name));
-  const candidates = event.kind === "exec_read" ? ["read_file", "readFile", "read", "Read"] : [];
-  return candidates.find((name) => names.has(name)) ?? null;
+/**
+ * Map cursor's built-in tool requests (exec_read / exec_write / exec_shell /
+ * etc.) onto the client's declared MCP tools so the OpenAI tool_call we
+ * surface uses the client's argument names — not cursor's. Schema-aware:
+ * if the client's tool declares `filePath`, we emit `filePath`; if it
+ * declares `path`, we emit `path`. Hermes uses `path`/`read_file`,
+ * opencode uses `filePath`/`read|write|edit|bash`. Both must work.
+ *
+ * Without this mapping, cursor models (claude/grok/composer) emit tool calls
+ * through their built-ins, OmniRoute would translate them with cursor's wire
+ * names (`path`, `command`), and clients with different schemas (opencode)
+ * reject every call with a SchemaError — leaving the agent loop stuck on
+ * "tool was called with invalid arguments" forever.
+ *
+ * Returns null when no matching client tool exists. Caller then either
+ * rejects the built-in (so the model retries with a declared MCP tool) or
+ * lets it pass through unchanged.
+ */
+type BuiltinToolMapping = {
+  toolName: string;
+  args: Record<string, unknown>;
+};
+
+type ClientToolSchema = {
+  properties?: Record<string, { type?: string; description?: string } | undefined>;
+  required?: string[];
+};
+
+// Candidate client tool names per cursor exec kind, ordered by preference.
+// Hermes uses snake_case names like "read_file"; opencode uses short names
+// like "read"; we accept either (and a few capitalization variants).
+const BUILTIN_TOOL_CANDIDATES: Partial<Record<ExecServerEvent["kind"], string[]>> = {
+  exec_read: ["read_file", "readFile", "read", "Read"],
+  exec_write: ["write_file", "writeFile", "write", "Write"],
+  exec_ls: ["list_directory", "list_dir", "list", "ls", "Ls", "glob"],
+  exec_grep: ["grep", "ripgrep", "search", "Grep"],
+  exec_shell: ["bash", "shell", "run_command", "Bash", "execute"],
+  exec_shell_stream: ["bash", "shell", "run_command", "Bash", "execute"],
+  exec_bg_shell: ["bash", "shell", "run_command", "Bash", "execute"],
+};
+
+// Candidate parameter names per logical concept. We probe the client tool's
+// schema for each candidate and use the first match. The "native" name
+// (cursor's own wire name — `path`, `command`, etc.) is the fallback when
+// no schema is provided or no candidate is found, so legacy callers without
+// a schema continue to see cursor's native arg names unchanged.
+const PARAM_CANDIDATES: Record<string, { native: string; aliases: string[] }> = {
+  path: { native: "path", aliases: ["filePath", "file_path", "filepath", "file", "target_file"] },
+  content: { native: "content", aliases: ["fileText", "file_text", "text", "body", "newContent"] },
+  command: { native: "command", aliases: ["cmd", "shell_command", "script"] },
+  pattern: { native: "pattern", aliases: ["query", "regex", "search"] },
+  description: { native: "description", aliases: ["purpose", "intent", "explanation"] },
+};
+
+function findClientToolSchema(
+  toolName: string,
+  rawTools: OpenAITool[] | undefined
+): ClientToolSchema | undefined {
+  if (!rawTools) return undefined;
+  for (const t of rawTools) {
+    if (t.function?.name === toolName) {
+      return (t.function.parameters as ClientToolSchema | undefined) ?? undefined;
+    }
+  }
+  return undefined;
 }
 
-function builtinToolArguments(event: ExecServerEvent): Record<string, unknown> | null {
-  if (event.kind === "exec_read") return { path: event.path };
-  return null;
+function mapParam(
+  schema: ClientToolSchema | undefined,
+  logicalKey: keyof typeof PARAM_CANDIDATES,
+  out: Record<string, unknown>,
+  value: string
+): boolean {
+  if (!value && value !== "") return false;
+  const { native, aliases } = PARAM_CANDIDATES[logicalKey];
+  const props = schema?.properties ?? {};
+  // Prefer cursor's native name if the schema declares it (Hermes-style).
+  if (native in props) {
+    out[native] = value;
+    return true;
+  }
+  // Otherwise try the client-specific aliases in priority order
+  // (opencode declares filePath; some clients use file_path; etc).
+  for (const alias of aliases) {
+    if (alias in props) {
+      out[alias] = value;
+      return true;
+    }
+  }
+  // No schema or no matching field — emit under cursor's native name so
+  // legacy clients without a schema in the request body still work.
+  out[native] = value;
+  return false;
+}
+
+function mapBuiltinToClientTool(
+  event: ExecServerEvent,
+  rawTools: OpenAITool[] | undefined,
+  mcpTools: McpToolDefinition[] | undefined
+): BuiltinToolMapping | null {
+  const candidates = BUILTIN_TOOL_CANDIDATES[event.kind];
+  if (!candidates) return null;
+
+  const names = new Set((mcpTools ?? []).map((t) => t.toolName || t.name));
+  const toolName = candidates.find((name) => names.has(name));
+  if (!toolName) return null;
+
+  const schema = findClientToolSchema(toolName, rawTools);
+  const args: Record<string, unknown> = {};
+
+  switch (event.kind) {
+    case "exec_read":
+    case "exec_ls":
+    case "exec_delete":
+      mapParam(schema, "path", args, event.path);
+      break;
+    case "exec_write":
+      mapParam(schema, "path", args, event.path);
+      mapParam(schema, "content", args, event.content);
+      break;
+    case "exec_grep":
+      mapParam(schema, "pattern", args, event.pattern);
+      break;
+    case "exec_shell":
+    case "exec_shell_stream":
+    case "exec_bg_shell":
+      mapParam(schema, "command", args, event.command);
+      // bash-style tools often require a description; populate a placeholder
+      // so opencode's schema validation passes. The model didn't supply one
+      // because cursor's built-in doesn't have that field.
+      if ((schema?.required ?? []).includes("description")) {
+        mapParam(schema, "description", args, "Run command requested by model");
+      }
+      break;
+    default:
+      return null;
+  }
+  return { toolName, args };
 }
 
 const CURSOR_AGENT_HOST = "agentn.global.api5.cursor.sh";
@@ -567,6 +692,11 @@ export function processFrame(
   opts: {
     h2Req?: import("http2").ClientHttp2Stream;
     mcpTools?: McpToolDefinition[];
+    // Raw OpenAI tool definitions from the client request — used by
+    // mapBuiltinToClientTool to inspect each tool's parameter schema so
+    // built-in arg names get rewritten onto the client's expected fields
+    // (`path` → `filePath` for opencode, kept as `path` for Hermes, etc).
+    rawTools?: OpenAITool[];
     blobStore?: Map<string, Buffer>;
     endStream?: boolean;
   } = {}
@@ -693,9 +823,18 @@ export function processFrame(
       // alive for the next OpenAI call (which arrives with role:"tool").
       ctx.endReason = "tool_calls";
     } else {
-      const toolName = findClientToolNameForBuiltin(event, opts.mcpTools);
-      const args = builtinToolArguments(event);
-      if (event.kind === "exec_read" && toolName && args) {
+      // Cursor models reach for their built-in tools (exec_read/exec_write/
+      // exec_shell/exec_grep/etc.) even when the client has declared MCP
+      // tools that do the same job — they're trained on cursor's tools and
+      // ignore the alternatives. mapBuiltinToClientTool reroutes those
+      // built-ins onto the client's declared tools, mapping cursor's argument
+      // names (path/command/...) onto the client's schema (filePath, etc.).
+      // If the client doesn't have a matching tool we fall through to the
+      // rejection encoder so the model retries with an MCP tool instead of
+      // hanging on a built-in we can't fulfill.
+      const mapping = mapBuiltinToClientTool(event, opts.rawTools, opts.mcpTools);
+      if (mapping) {
+        const { toolName, args } = mapping;
         const argumentsJson = JSON.stringify(args);
         const completed = findCompletedToolResult(ctx, toolName, argumentsJson);
         if (completed) {
@@ -731,13 +870,19 @@ export function processFrame(
           name: toolName,
           argumentsJson,
         });
-        ctx.pendingToolCalls.set(openAIToolCallId, {
-          kind: "exec_read",
-          execMsgId: event.execMsgId,
-          execId: event.execId,
-          toolName,
-          path: event.path,
-        });
+        // Track only the built-ins whose tool result we know how to wire
+        // back to cursor on the same h2 stream. exec_read has a dedicated
+        // result encoder; everything else goes through the cold-resume
+        // path (next request opens a fresh h2 with flattened history).
+        if (event.kind === "exec_read") {
+          ctx.pendingToolCalls.set(openAIToolCallId, {
+            kind: "exec_read",
+            execMsgId: event.execMsgId,
+            execId: event.execId,
+            toolName,
+            path: event.path,
+          });
+        }
         ctx.endReason = "tool_calls";
         return;
       }
@@ -1000,6 +1145,7 @@ export class CursorExecutor extends BaseExecutor {
     },
     ctx: StreamCtx,
     mcpTools: McpToolDefinition[] | undefined,
+    rawTools: OpenAITool[] | undefined,
     blobStore: Map<string, Buffer> | undefined,
     signal?: AbortSignal
   ): Promise<void> {
@@ -1084,6 +1230,7 @@ export class CursorExecutor extends BaseExecutor {
             processFrame(payload, ctx, ackedExecIds, {
               h2Req: h2.req,
               mcpTools,
+              rawTools,
               blobStore,
               endStream,
             });
@@ -1366,7 +1513,14 @@ export class CursorExecutor extends BaseExecutor {
             completedToolResults
           );
           try {
-            await this.driveH2(h2, ctx, mcpTools, blobStore, signal);
+            await this.driveH2(
+              h2,
+              ctx,
+              mcpTools,
+              body.tools as OpenAITool[] | undefined,
+              blobStore,
+              signal
+            );
             this.finalizeSseStream(ctx, body);
             // If Cursor returned a Connect-RPC JSON error (e.g. credits
             // exhausted), tear down this account so the next request hits a
@@ -1404,7 +1558,14 @@ export class CursorExecutor extends BaseExecutor {
     // Non-streaming: drive to completion, return chat.completion JSON.
     const ctx = newStreamCtx(model, () => {}, completedToolResults);
     try {
-      await this.driveH2(h2, ctx, mcpTools, blobStore, signal);
+      await this.driveH2(
+        h2,
+        ctx,
+        mcpTools,
+        body.tools as OpenAITool[] | undefined,
+        blobStore,
+        signal
+      );
     } catch (err) {
       finishLifecycle(ctx, true);
       const message = err instanceof Error ? err.message : String(err);

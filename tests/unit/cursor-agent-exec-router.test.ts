@@ -82,10 +82,20 @@ test("decodeExecServerEvent recognizes read_args (field 7) with path", () => {
 });
 
 test("decodeExecServerEvent recognizes write_args (field 3)", () => {
-  const variant = stringField(1, "/tmp/x");
+  // WriteArgs has both path (field 1) and content (field 2) — the model
+  // sends the file content alongside the path when invoking cursor's
+  // built-in write tool, and we need both to translate the call onto the
+  // client's write/edit tool with a usable schema.
+  const variant = Buffer.concat([stringField(1, "/tmp/x"), stringField(2, "hello world\n")]);
   const esm = buildExecServerMessage(3, "exec-w", 3, variant);
   const event = decodeExecServerEvent(buildAgentServerMessage(esm));
-  assert.deepEqual(event, { kind: "exec_write", execMsgId: 3, execId: "exec-w", path: "/tmp/x" });
+  assert.deepEqual(event, {
+    kind: "exec_write",
+    execMsgId: 3,
+    execId: "exec-w",
+    path: "/tmp/x",
+    content: "hello world\n",
+  });
 });
 
 test("decodeExecServerEvent recognizes delete_args (field 4)", () => {
@@ -106,7 +116,12 @@ test("decodeExecServerEvent recognizes grep_args (field 5)", () => {
   const variant = stringField(1, "pattern");
   const esm = buildExecServerMessage(6, "exec-g", 5, variant);
   const event = decodeExecServerEvent(buildAgentServerMessage(esm));
-  assert.deepEqual(event, { kind: "exec_grep", execMsgId: 6, execId: "exec-g" });
+  assert.deepEqual(event, {
+    kind: "exec_grep",
+    execMsgId: 6,
+    execId: "exec-g",
+    pattern: "pattern",
+  });
 });
 
 test("decodeExecServerEvent recognizes diagnostics_args (field 9)", () => {

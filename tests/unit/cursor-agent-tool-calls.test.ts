@@ -76,6 +76,39 @@ function buildReadArgsEvent(execMsgId: number, execId: string, filePath: string)
   return lenPrefixed(2, esm);
 }
 
+function buildWriteArgsEvent(
+  execMsgId: number,
+  execId: string,
+  filePath: string,
+  content: string
+): Buffer {
+  const writeArgs = Buffer.concat([stringField(1, filePath), stringField(2, content)]);
+  const esm = Buffer.concat([
+    varintField(1, execMsgId),
+    stringField(15, execId),
+    lenPrefixed(3, writeArgs), // ESM_WRITE_ARGS = 3
+  ]);
+  return lenPrefixed(2, esm);
+}
+
+function buildShellArgsEvent(
+  execMsgId: number,
+  execId: string,
+  command: string,
+  workingDir = ""
+): Buffer {
+  const shellArgs = Buffer.concat([
+    stringField(1, command),
+    workingDir ? stringField(2, workingDir) : Buffer.alloc(0),
+  ]);
+  const esm = Buffer.concat([
+    varintField(1, execMsgId),
+    stringField(15, execId),
+    lenPrefixed(2, shellArgs), // ESM_SHELL_ARGS = 2
+  ]);
+  return lenPrefixed(2, esm);
+}
+
 // ─── decodeProtobufValue round-trip tests ──────────────────────────────────
 
 test("decodeProtobufValue round-trips primitives", () => {
@@ -296,6 +329,152 @@ test("processFrame surfaces Cursor built-in read as a matching OpenAI tool_call"
   assert.equal(initChunk.delta?.tool_calls?.[0].function?.name, "read_file");
   const argsChunk = parseChunk(emitted[2]);
   assert.equal(argsChunk.delta?.tool_calls?.[0].function?.arguments, '{"path":"/tmp/foo.txt"}');
+});
+
+// ─── Schema-aware translation of cursor built-ins onto client tools ────────
+//
+// Cursor's models (especially composer-2 / composer-2.5) emit tool calls
+// through cursor's built-in tools (exec_read, exec_write, exec_shell) with
+// cursor's wire arg names (`path`, `command`). Clients like opencode declare
+// their own tools with different schemas (`filePath`, `command + description`).
+// processFrame must rewrite cursor's native args onto whatever shape the
+// client actually declared, otherwise opencode rejects every call with
+// SchemaError and the agent loop is stuck reading a file that doesn't exist.
+
+test("processFrame translates exec_read path → filePath for opencode-style schema", () => {
+  const emitted: string[] = [];
+  const ctx = newStreamCtx("auto", (s) => emitted.push(s));
+  const acked = new Set<string>();
+
+  processFrame(buildReadArgsEvent(11, "exec-read", "/tmp/foo.txt"), ctx, acked, {
+    mcpTools: [
+      {
+        name: "read",
+        description: "Read a file",
+        inputSchemaBytes: Buffer.alloc(0),
+        toolName: "read",
+      },
+    ],
+    rawTools: [
+      {
+        type: "function",
+        function: {
+          name: "read",
+          parameters: {
+            type: "object",
+            properties: { filePath: { type: "string" }, offset: { type: "number" } },
+            required: ["filePath"],
+          },
+        },
+      },
+    ],
+  });
+
+  assert.equal(ctx.toolCalls.length, 1);
+  assert.equal(ctx.toolCalls[0].name, "read");
+  assert.equal(ctx.toolCalls[0].argumentsJson, JSON.stringify({ filePath: "/tmp/foo.txt" }));
+});
+
+test("processFrame translates exec_write to opencode write({filePath, content})", () => {
+  const emitted: string[] = [];
+  const ctx = newStreamCtx("auto", (s) => emitted.push(s));
+  const acked = new Set<string>();
+
+  processFrame(
+    buildWriteArgsEvent(12, "exec-write", "/tmp/fib.cpp", "int main(){}\n"),
+    ctx,
+    acked,
+    {
+      mcpTools: [
+        {
+          name: "write",
+          description: "Write a file",
+          inputSchemaBytes: Buffer.alloc(0),
+          toolName: "write",
+        },
+      ],
+      rawTools: [
+        {
+          type: "function",
+          function: {
+            name: "write",
+            parameters: {
+              type: "object",
+              properties: { filePath: { type: "string" }, content: { type: "string" } },
+              required: ["filePath", "content"],
+            },
+          },
+        },
+      ],
+    }
+  );
+
+  assert.equal(ctx.endReason, "tool_calls");
+  assert.equal(ctx.toolCalls.length, 1);
+  assert.equal(ctx.toolCalls[0].name, "write");
+  assert.equal(
+    ctx.toolCalls[0].argumentsJson,
+    JSON.stringify({ filePath: "/tmp/fib.cpp", content: "int main(){}\n" })
+  );
+});
+
+test("processFrame falls back to cursor's native arg name when no schema is given", () => {
+  // Hermes flow: tool registered as `read_file` with `path` param. With no
+  // raw OpenAI tool list available, the mapper must use cursor's native
+  // `path` field name so legacy callers continue to work — even before any
+  // schema-aware client was a thing.
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(buildReadArgsEvent(13, "exec-read-hermes", "/tmp/foo.txt"), ctx, new Set(), {
+    mcpTools: [
+      {
+        name: "read_file",
+        description: "Read a file",
+        inputSchemaBytes: Buffer.alloc(0),
+        toolName: "read_file",
+      },
+    ],
+    // rawTools intentionally omitted
+  });
+  assert.equal(ctx.toolCalls[0].argumentsJson, JSON.stringify({ path: "/tmp/foo.txt" }));
+});
+
+test("processFrame translates exec_shell onto opencode bash, populating required description", () => {
+  // opencode's `bash` tool requires both `command` and `description`. Cursor
+  // sends only the command — we inject a placeholder description so the
+  // schema validation in the client doesn't reject the call.
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(buildShellArgsEvent(14, "exec-sh", "ls -la /tmp"), ctx, new Set(), {
+    mcpTools: [
+      {
+        name: "bash",
+        description: "Run shell",
+        inputSchemaBytes: Buffer.alloc(0),
+        toolName: "bash",
+      },
+    ],
+    rawTools: [
+      {
+        type: "function",
+        function: {
+          name: "bash",
+          parameters: {
+            type: "object",
+            properties: {
+              command: { type: "string" },
+              description: { type: "string" },
+            },
+            required: ["command", "description"],
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(ctx.toolCalls.length, 1);
+  assert.equal(ctx.toolCalls[0].name, "bash");
+  const args = JSON.parse(ctx.toolCalls[0].argumentsJson);
+  assert.equal(args.command, "ls -la /tmp");
+  assert.equal(typeof args.description, "string");
+  assert.ok(args.description.length > 0);
 });
 
 test("processFrame converts repeated completed built-in read calls into final text", () => {
