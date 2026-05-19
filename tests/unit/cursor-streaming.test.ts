@@ -162,6 +162,64 @@ test("processFrame captures mid-stream JSON error", () => {
   assert.match(ctx.midStreamError!.message, /rate limited/);
 });
 
+// ─── Connect-RPC end-of-stream trailer handling ────────────────────────────
+//
+// Frames with bit 1 of the flag byte set (flag=0x02 / 0x03) deliver a JSON
+// trailer instead of a protobuf message. Errors in the trailer were
+// previously dropped — decompressFrame threw, the warning was logged, and
+// the executor's SSE stream finalized without surfacing the upstream cause,
+// which produced [CURSOR-FRAME] decode-failed + STREAM_EARLY_EOF + account
+// fallback churn in production logs. processFrame must intercept the
+// endStream flag before any of the protobuf decoders run.
+
+test("processFrame surfaces an end-stream error trailer as midStreamError", () => {
+  const trailer = Buffer.from(
+    '{"code":"resource_exhausted","message":"You have exhausted your credits"}',
+    "utf8"
+  );
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(trailer, ctx, new Set(), { endStream: true });
+  assert.equal(ctx.endReason, "server_end");
+  assert.ok(ctx.midStreamError, "midStreamError populated");
+  assert.equal(ctx.midStreamError!.status, 429);
+  assert.match(ctx.midStreamError!.message, /exhausted/);
+});
+
+test("processFrame extracts nested gRPC-style error from trailer", () => {
+  const trailer = Buffer.from(
+    '{"error":{"code":"unauthenticated","message":"OAuth token expired"}}',
+    "utf8"
+  );
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(trailer, ctx, new Set(), { endStream: true });
+  assert.equal(ctx.midStreamError?.status, 401);
+  assert.match(ctx.midStreamError?.message ?? "", /OAuth token expired/);
+});
+
+test("processFrame ignores success trailers but still ends the stream", () => {
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(Buffer.from("{}", "utf8"), ctx, new Set(), { endStream: true });
+  assert.equal(ctx.endReason, "server_end");
+  assert.equal(ctx.midStreamError, null);
+});
+
+test("processFrame does not overwrite earlier text with a later trailer error", () => {
+  // If text already streamed, a trailer arriving after must not clobber the
+  // emitted content into an error response (the client would lose the
+  // partial reply). Mirrors the existing JSON-error envelope behavior.
+  const ctx = newStreamCtx("auto", () => {});
+  processFrame(buildTextDeltaPayload("partial answer"), ctx, new Set());
+  processFrame(
+    Buffer.from('{"code":"internal","message":"server reset"}', "utf8"),
+    ctx,
+    new Set(),
+    { endStream: true }
+  );
+  assert.equal(ctx.totalText, "partial answer");
+  assert.equal(ctx.midStreamError, null);
+  assert.equal(ctx.endReason, "server_end");
+});
+
 test("processFrame JSON error after text terminates without overwriting content", () => {
   const ctx = newStreamCtx("auto", () => {});
   processFrame(buildTextDeltaPayload("partial"), ctx, new Set());

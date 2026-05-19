@@ -1,12 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import zlib from "node:zlib";
 import {
   resolveRequestedModel,
   encodeAgentRunRequest,
   buildAgentRequestBody,
   iterateConnectFrames,
   decodeAgentServerMessage,
+  decompressFrame,
   flattenMessages,
+  parseConnectEndStreamTrailer,
   wrapConnectFrame,
   encodeExecReadRejected,
   encodeExecReadResult,
@@ -103,6 +106,60 @@ test("iterateConnectFrames + decodeAgentServerMessage extract a text delta", () 
   assert.equal(frames.length, 1);
   const deltas = decodeAgentServerMessage(frames[0].payload);
   assert.deepEqual(deltas, [{ kind: "text", text: "hello" }]);
+});
+
+// ─── Connect-RPC end-of-stream framing ─────────────────────────────────────
+//
+// Connect-RPC flag byte is a bitfield: bit 0 = gzip, bit 1 = end-of-stream
+// (body is a JSON trailer, NOT a protobuf message). Previously the cursor
+// decoder treated `flag != 0` as "compressed" and threw on flag=0x02 —
+// surfacing as `[CURSOR-FRAME] decode failed flag=0x2` warnings and
+// STREAM_EARLY_EOF account churn whenever cursor returned an error trailer
+// with no preceding data frames (quota / auth rejections).
+
+test("decompressFrame leaves an end-of-stream frame (flag=0x02) uncompressed", () => {
+  const trailer = Buffer.from('{"code":"resource_exhausted","message":"out of credits"}', "utf8");
+  // flag=0x02 means end-of-stream, body is the JSON trailer as-is.
+  const decoded = decompressFrame(trailer, 0x02);
+  assert.equal(decoded.toString("utf8"), trailer.toString("utf8"));
+});
+
+test("decompressFrame gunzips an end-of-stream + gzip frame (flag=0x03)", () => {
+  const trailerJson = '{"code":"unauthenticated","message":"token expired"}';
+  const gz = zlib.gzipSync(Buffer.from(trailerJson, "utf8"));
+  const decoded = decompressFrame(gz, 0x03);
+  assert.equal(decoded.toString("utf8"), trailerJson);
+});
+
+test("parseConnectEndStreamTrailer extracts Connect-style code + message", () => {
+  const trailer = Buffer.from('{"code":"resource_exhausted","message":"out of credits"}', "utf8");
+  const parsed = parseConnectEndStreamTrailer(trailer);
+  assert.deepEqual(parsed, { code: "resource_exhausted", message: "out of credits" });
+});
+
+test("parseConnectEndStreamTrailer extracts nested gRPC-style error", () => {
+  const trailer = Buffer.from(
+    '{"error":{"code":"unauthenticated","message":"token expired"}}',
+    "utf8"
+  );
+  const parsed = parseConnectEndStreamTrailer(trailer);
+  assert.deepEqual(parsed, { code: "unauthenticated", message: "token expired" });
+});
+
+test("parseConnectEndStreamTrailer returns null for empty / metadata-only trailers", () => {
+  assert.equal(parseConnectEndStreamTrailer(Buffer.from("{}", "utf8")), null);
+  assert.equal(
+    parseConnectEndStreamTrailer(Buffer.from('{"metadata":{"foo":["bar"]}}', "utf8")),
+    null
+  );
+});
+
+test("parseConnectEndStreamTrailer returns null for non-JSON bodies", () => {
+  // Real protobuf-encoded interaction update payload, not JSON.
+  const protoLike = Buffer.from([0x0a, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f]); // "hello"
+  assert.equal(parseConnectEndStreamTrailer(protoLike), null);
+  // Truncated `{` only — too short to be a valid JSON object.
+  assert.equal(parseConnectEndStreamTrailer(Buffer.from([0x7b])), null);
 });
 
 test("flattenMessages handles a simple single user message", () => {

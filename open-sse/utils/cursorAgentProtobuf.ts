@@ -297,9 +297,22 @@ function decodeFields(buf: Buffer): Field[] {
 }
 
 // ─── Connect-RPC framing ───────────────────────────────────────────────────
+//
+// Each frame header is one flag byte + 4-byte big-endian length.
+// The flag byte is a bitfield (Connect-RPC streaming spec):
+//   bit 0 (0x01) = body is compressed (gzip)
+//   bit 1 (0x02) = end-of-stream frame (body is a JSON trailer, NOT a protobuf
+//                  message). The JSON trailer carries optional `error` and
+//                  `metadata` fields. The most-common cursor failure mode —
+//                  immediate quota / auth rejection — is delivered as a single
+//                  flag=0x02 frame with no preceding data frames.
+// Bits 2-7 are reserved. Treating flag != 0 as "compressed" silently dropped
+// every end-of-stream frame and surfaced as `[CURSOR-FRAME] decode failed
+// flag=0x2` warnings → STREAM_EARLY_EOF → account fallback churn.
 
 const FLAG_NONE = 0x00;
 const FLAG_GZIP = 0x01;
+export const FLAG_END_STREAM = 0x02;
 
 export function wrapConnectFrame(payload: Buffer, compressed = false): Buffer {
   const data = compressed ? zlib.gzipSync(payload) : payload;
@@ -310,15 +323,17 @@ export function wrapConnectFrame(payload: Buffer, compressed = false): Buffer {
 }
 
 /**
- * Decompress a Connect-RPC frame body across the algorithms Cursor has been
- * observed to use. flag=0x01 is gzip, but tool_use response frames have been
- * seen with flag=0x02/0x03 carrying zlib-deflate or raw-deflate payloads.
- * Issue #250 added an inflate fallback that was later lost during refactors,
- * causing tool calls to be silently dropped. This helper restores it and
- * includes the actual flag in error messages so failures are diagnosable.
+ * Decompress a Connect-RPC frame body. Compression is keyed on bit 0
+ * (FLAG_GZIP) of the flag byte — NOT on `flag != 0`, which would mis-classify
+ * end-of-stream frames (flag=0x02, uncompressed JSON trailer; flag=0x03,
+ * gzip-compressed JSON trailer) as compressed protobuf and throw.
+ *
+ * gzip is the documented Connect-RPC compression, but cursor has been seen to
+ * emit zlib/raw-deflate payloads for some tool-use frames; the inflate
+ * fallbacks restore the behavior from issue #250.
  */
 export function decompressFrame(raw: Buffer, flag: number): Buffer {
-  if (flag === FLAG_NONE) return raw;
+  if ((flag & FLAG_GZIP) === 0) return raw;
   const errs: string[] = [];
   try {
     return zlib.gunzipSync(raw);
@@ -338,6 +353,43 @@ export function decompressFrame(raw: Buffer, flag: number): Buffer {
   throw new Error(
     `cursor frame decompression failed for flag=0x${flag.toString(16)} (len=${raw.length}): ${errs.join("; ")}`
   );
+}
+
+/**
+ * Parse a Connect-RPC end-of-stream trailer. The body of a flag=0x02/0x03 frame
+ * is a JSON object with optional `code` / `message` (Connect-RPC standard) or
+ * `error` (gRPC-style nested) fields. Returns null if the body isn't JSON, has
+ * no error info, or fails to parse.
+ *
+ * Wire samples observed from cursor's agentn.global.api5.cursor.sh:
+ *   {"code":"resource_exhausted","message":"You have exhausted your...","details":[...]}
+ *   {"error":{"code":"unauthenticated","message":"..."}}
+ *   {} or {"metadata":{...}}  — success trailer, no error to surface
+ */
+export function parseConnectEndStreamTrailer(
+  body: Buffer
+): { message: string; code: string } | null {
+  if (body.length < 2 || body[0] !== 0x7b) return null;
+  try {
+    const parsed = JSON.parse(body.toString("utf8")) as {
+      code?: string;
+      message?: string;
+      error?: { code?: string; message?: string; details?: unknown };
+    };
+    const err = parsed?.error ?? null;
+    const code =
+      (typeof parsed?.code === "string" && parsed.code) ||
+      (err && typeof err.code === "string" && err.code) ||
+      "";
+    const message =
+      (typeof parsed?.message === "string" && parsed.message) ||
+      (err && typeof err.message === "string" && err.message) ||
+      "";
+    if (!code && !message) return null;
+    return { code, message: message || code };
+  } catch {
+    return null;
+  }
 }
 
 export type ConnectFrame = {

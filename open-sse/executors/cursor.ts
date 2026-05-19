@@ -34,6 +34,8 @@ import {
   messageContentToText,
   openAIToolsToMcpDefs,
   decompressFrame,
+  parseConnectEndStreamTrailer,
+  FLAG_END_STREAM,
   type ChatMessage,
   type ExecServerEvent,
   type McpToolDefinition,
@@ -258,6 +260,25 @@ type CursorHttpResponse = {
   body: Buffer;
 };
 
+// Connect-RPC error codes → HTTP status. Used to map both the wrapping JSON
+// error envelope (sent as a regular data frame on protocol errors) and the
+// end-of-stream trailer (flag=0x02/0x03 frame, where status flows back into
+// the executor's account-fallback path).
+const CONNECT_CODE_TO_STATUS: Record<string, number> = {
+  resource_exhausted: HTTP_STATUS.RATE_LIMITED,
+  unauthenticated: HTTP_STATUS.UNAUTHORIZED,
+  permission_denied: HTTP_STATUS.FORBIDDEN,
+  unavailable: HTTP_STATUS.SERVICE_UNAVAILABLE,
+  deadline_exceeded: HTTP_STATUS.GATEWAY_TIMEOUT,
+  internal: HTTP_STATUS.SERVER_ERROR,
+  invalid_argument: HTTP_STATUS.BAD_REQUEST,
+  not_found: HTTP_STATUS.NOT_FOUND,
+};
+
+function statusFromConnectCode(code: string): number {
+  return CONNECT_CODE_TO_STATUS[code] ?? HTTP_STATUS.BAD_REQUEST;
+}
+
 function tryParseJsonError(payload: Buffer): { message: string; status: number } | null {
   if (payload.length < 2 || payload[0] !== 0x7b) return null;
   try {
@@ -270,12 +291,20 @@ function tryParseJsonError(payload: Buffer): { message: string; status: number }
       err?.details?.[0]?.debug?.details?.detail ||
       err?.message ||
       text;
-    const status =
-      err?.code === "resource_exhausted" ? HTTP_STATUS.RATE_LIMITED : HTTP_STATUS.BAD_REQUEST;
-    return { message, status };
+    return { message, status: statusFromConnectCode(err?.code) };
   } catch {
     return null;
   }
+}
+
+/**
+ * Map a Connect-RPC end-of-stream trailer to a midStreamError shape. Returns
+ * null for trailers that don't carry an error (empty `{}` or metadata-only).
+ */
+function readConnectTrailerError(payload: Buffer): { message: string; status: number } | null {
+  const parsed = parseConnectEndStreamTrailer(payload);
+  if (!parsed) return null;
+  return { message: parsed.message, status: statusFromConnectCode(parsed.code) };
 }
 
 // ─── Phase 4: streaming dispatch context ───────────────────────────────────
@@ -539,8 +568,25 @@ export function processFrame(
     h2Req?: import("http2").ClientHttp2Stream;
     mcpTools?: McpToolDefinition[];
     blobStore?: Map<string, Buffer>;
+    endStream?: boolean;
   } = {}
 ): void {
+  // 0. Connect-RPC end-of-stream trailer (flag=0x02/0x03). Body is a JSON
+  // object — never protobuf — so it must be intercepted before any of the
+  // protobuf decoders below run. Trailers with an error payload (most often
+  // resource_exhausted / unauthenticated when an account is exhausted or has
+  // had its OAuth revoked) populate midStreamError so the executor can both
+  // surface a clean error to the client AND trigger account auto-disable;
+  // success trailers (empty `{}` or metadata-only) just close the stream.
+  if (opts.endStream) {
+    const trailerErr = readConnectTrailerError(payload);
+    if (trailerErr && ctx.totalText.length === 0 && ctx.toolCalls.length === 0) {
+      ctx.midStreamError = trailerErr;
+    }
+    ctx.endReason = "server_end";
+    return;
+  }
+
   // 1. JSON error envelope (Connect-RPC style — usually status > 200).
   const jsonError = tryParseJsonError(payload);
   if (jsonError) {
@@ -1024,17 +1070,23 @@ export class CursorExecutor extends BaseExecutor {
           if (pos + 5 + length > buf.length) break; // partial frame; wait
           const flag = buf[pos];
           const raw = buf.subarray(pos + 5, pos + 5 + length);
+          const endStream = (flag & FLAG_END_STREAM) !== 0;
           // Per-frame error isolation: if decompression or processFrame throws
           // on one frame, log and skip past it instead of getting stuck on
           // the same offset and hanging until the safety timer fires.
           //
-          // Cursor compresses with gzip (flag=0x01) for most frames but uses
-          // zlib-deflate for some tool_use response frames (flag=0x02/0x03).
-          // decompressFrame tries gunzip → inflate → inflateRaw so those
-          // frames don't get silently dropped (regression of fix #250).
+          // Connect-RPC framing: bit 0 of the flag byte is gzip (handled by
+          // decompressFrame), bit 1 is end-of-stream (body is a JSON trailer
+          // that processFrame parses out-of-band for errors so we don't
+          // mis-classify it as a malformed protobuf message).
           try {
             const payload = decompressFrame(raw, flag);
-            processFrame(payload, ctx, ackedExecIds, { h2Req: h2.req, mcpTools, blobStore });
+            processFrame(payload, ctx, ackedExecIds, {
+              h2Req: h2.req,
+              mcpTools,
+              blobStore,
+              endStream,
+            });
           } catch (err) {
             // Use console.warn (not debugLog) so failures surface without
             // requiring CURSOR_DEBUG=1. Include flag hex + length so we can
@@ -1095,6 +1147,31 @@ export class CursorExecutor extends BaseExecutor {
         { status, headers: { "Content-Type": "application/json" } }
       );
 
+    // ── Read-file follow-up short-circuit (documented compatibility layer) ──
+    //
+    // When a turn ends on a read_file tool result, return the file contents to
+    // the client directly instead of round-tripping through cursor's agent.
+    //
+    // Why: cursor's agent backend has been observed (across thinking + non-
+    // thinking + grok variants) to return ~4 output tokens of acknowledgment
+    // ("Done.", "ok") on the immediate follow-up after a read_file tool
+    // result, even with the flattenMessages continuation directive present —
+    // the model treats the prior turn as already-complete and refuses to
+    // synthesize a content response. Surfacing the raw file contents as the
+    // assistant's reply is what every CLI client (Hermes, opencode) actually
+    // wants here, and it preserves the user's "answer using the tool I
+    // declared" expectation without a useless second LLM round trip.
+    //
+    // Scope: ONLY fires when (a) the last message is a tool result and (b)
+    // the most recent matching tool call was `read_file`. Other tools
+    // (write, shell, grep, etc.) continue through the normal cold-resume or
+    // inline-session path. A follow-up user message (e.g. "summarize the
+    // file") doesn't trigger this — `isToolFollowUp` is false for new user
+    // turns, so multi-turn flows after a read still reach cursor for real.
+    //
+    // Tests: cursor-agent-tool-calls.test.ts covers (i) the short-circuit
+    // emission shape, (ii) translated XML tool-result detection, and (iii)
+    // the multi-turn case where the user asks a follow-up question.
     const completedReadFileResult = [...completedToolResults]
       .reverse()
       .find((result) => result.name === "read_file" && formatCompletedToolResultContent(result));
