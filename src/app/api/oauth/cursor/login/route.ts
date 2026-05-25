@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
 import { spawn, ChildProcess } from "child_process";
-import { mkdtemp, readFile, rm } from "fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import { randomUUID } from "crypto";
 import { CursorService } from "@/lib/oauth/services/cursor";
-import { createProviderConnection, isCloudEnabled, resolveProxyForProvider } from "@/models";
+import { createProviderConnection, isCloudEnabled, resolveProxyForProvider, updateProviderConnection } from "@/models";
 import { getConsistentMachineId } from "@/shared/utils/machineId";
 import { syncToCloud } from "@/lib/cloudSync";
 import { isAuthRequired, isAuthenticated } from "@/shared/utils/apiAuth";
@@ -26,6 +26,7 @@ import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
 const URL_PREFIX = "Open a browser and navigate to this link: ";
 const SESSION_TTL_MS = 5 * 60 * 1000;
 const URL_WAIT_MS = 15 * 1000;
+const HOMES_ROOT = process.env.CURSOR_AGENT_HOMES_DIR || "/app/data/cursor-agent-homes";
 
 type SessionStatus = "pending" | "success" | "error";
 
@@ -38,6 +39,7 @@ type Session = {
   createdAt: number;
   error?: string;
   connection?: { id: string; provider: string; email: string | null };
+  homePersisted?: boolean;
 };
 
 const sessions: Map<string, Session> = new Map();
@@ -49,7 +51,9 @@ function reapExpired() {
       try {
         s.child?.kill("SIGTERM");
       } catch {}
-      rm(s.homeDir, { recursive: true, force: true }).catch(() => {});
+      if (!s.homePersisted) {
+        rm(s.homeDir, { recursive: true, force: true }).catch(() => {});
+      }
       sessions.delete(id);
     }
   }
@@ -99,6 +103,25 @@ async function persistFromAuthJson(session: Session): Promise<void> {
     },
     testStatus: "active",
   });
+
+  // Persist the cursor-agent HOME dir at a stable per-connection path so a
+  // background scheduler can run `cursor-agent status` against it later and
+  // capture the rotated accessToken from the updated auth.json.
+  try {
+    await mkdir(HOMES_ROOT, { recursive: true });
+    const targetDir = join(HOMES_ROOT, conn.id);
+    await rm(targetDir, { recursive: true, force: true });
+    await rename(session.homeDir, targetDir);
+    session.homeDir = targetDir;
+    session.homePersisted = true;
+    const existingPsd = (conn.providerSpecificData as Record<string, unknown> | null | undefined) || {};
+    await updateProviderConnection(conn.id, {
+      providerSpecificData: { ...existingPsd, cursorAgentHomeDir: targetDir },
+    });
+  } catch (e) {
+    console.warn("[cursor-login] failed to persist cursor-agent HOME dir:", e);
+    // Non-fatal: connection still works, but auto-refresh won't engage.
+  }
 
   session.connection = { id: conn.id, provider: conn.provider, email: conn.email };
   session.status = "success";
@@ -183,7 +206,9 @@ export async function POST(request: Request) {
         ? `${session.error}\n${detail}`
         : `cursor-agent exited (code=${code}, signal=${signal}): ${detail}`;
     } finally {
-      rm(session.homeDir, { recursive: true, force: true }).catch(() => {});
+      if (!session.homePersisted) {
+        rm(session.homeDir, { recursive: true, force: true }).catch(() => {});
+      }
       session.child = null;
     }
   });
@@ -204,7 +229,9 @@ export async function POST(request: Request) {
     } catch {}
     session.status = "error";
     if (!session.error) session.error = "cursor-agent did not print a login URL within timeout";
-    rm(session.homeDir, { recursive: true, force: true }).catch(() => {});
+    if (!session.homePersisted) {
+      rm(session.homeDir, { recursive: true, force: true }).catch(() => {});
+    }
     return NextResponse.json({ error: session.error }, { status: 500 });
   }
 
@@ -265,7 +292,9 @@ export async function DELETE(request: Request) {
   try {
     s.child?.kill("SIGTERM");
   } catch {}
-  rm(s.homeDir, { recursive: true, force: true }).catch(() => {});
+  if (!s.homePersisted) {
+    rm(s.homeDir, { recursive: true, force: true }).catch(() => {});
+  }
   sessions.delete(sessionId);
   return NextResponse.json({ ok: true });
 }

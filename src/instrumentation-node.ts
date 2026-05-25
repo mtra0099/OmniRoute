@@ -89,6 +89,7 @@ export async function registerNodejs(): Promise<void> {
     { startBackgroundRefresh },
     { ensureCloudSyncInitialized },
     { startProviderLimitsSyncScheduler },
+    { startCursorTokenRefreshScheduler },
     { getSettings },
     { applyRuntimeSettings },
     { startRuntimeConfigHotReload },
@@ -103,6 +104,7 @@ export async function registerNodejs(): Promise<void> {
     import("@/domain/quotaCache"),
     import("@/lib/initCloudSync"),
     import("@/shared/services/providerLimitsSyncScheduler"),
+    import("@/shared/services/cursorTokenRefreshScheduler"),
     import("@/lib/db/settings"),
     import("@/lib/config/runtimeSettings"),
     import("@/lib/config/hotReload"),
@@ -126,6 +128,8 @@ export async function registerNodejs(): Promise<void> {
     console.log("[STARTUP] Quota cache background refresh started");
     startProviderLimitsSyncScheduler();
     console.log("[STARTUP] Provider limits sync scheduler started");
+    startCursorTokenRefreshScheduler();
+    console.log("[STARTUP] Cursor token refresh scheduler started");
     const cloudSyncInitialized = await ensureCloudSyncInitialized();
     console.log(
       `[STARTUP] Cloud/model sync background bootstrap ${cloudSyncInitialized ? "initialized" : "skipped"}`
