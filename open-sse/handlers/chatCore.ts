@@ -3040,6 +3040,30 @@ export async function handleChatCore({
 
   trace("post_translation");
 
+  // csr/ Cursor-backed models expect Cursor-native tool names (Read/Grep/Write/Edit/Bash).
+  // Rename the client's tools so the model recognises them (keeps client schemas); the
+  // resulting _toolNameMap is extracted just below and restores originals on the response.
+  if (
+    process.env.CURSOR_TOOL_TRANSLATION === "1" &&
+    typeof provider === "string" &&
+    provider.startsWith("openai-compatible-") &&
+    /(?:standardagents\.ai|cursor-api)/i.test(
+      String(
+        (credentials as { providerSpecificData?: { baseUrl?: unknown } } | null | undefined)
+          ?.providerSpecificData?.baseUrl ?? ""
+      )
+    )
+  ) {
+    try {
+      const { remapCursorToolNamesInRequest } = await import(
+        "../services/cursorToolRemapper.ts"
+      );
+      remapCursorToolNamesInRequest(translatedBody as Record<string, unknown>);
+    } catch (e) {
+      log?.warn?.("TOOLS", `cursor tool remap failed: ${(e as Error)?.message}`);
+    }
+  }
+
   // Extract toolNameMap for response translation (Claude OAuth)
   const translatedToolNameMap = translatedBody._toolNameMap;
   const nativeClaudeToolNameMap = isClaudePassthrough

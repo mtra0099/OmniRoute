@@ -1246,6 +1246,7 @@ export function createSSEStream(options: StreamOptions = {}) {
 
                   // Track whether we need to re-serialize (separate from injectedUsage
                   // to avoid blocking subsequent finish_reason / usage mutations)
+                  let toolNameRestored = false;
                   const needsReserialization =
                     hadReasoningAlias || (delta?.content === "" && delta?.reasoning_content);
 
@@ -1253,6 +1254,18 @@ export function createSSEStream(options: StreamOptions = {}) {
                   if (delta?.tool_calls && delta.tool_calls.length > 0) {
                     passthroughHasToolCalls = true;
                     for (const tc of delta.tool_calls) {
+                      // Cursor tool translation: restore the client's original tool name
+                      // (model emitted a Cursor-native alias like Read/Grep/Write/Edit).
+                      if (
+                        tc?.function?.name &&
+                        toolNameMap instanceof Map &&
+                        (toolNameMap as Map<string, string>).has(tc.function.name)
+                      ) {
+                        tc.function.name = (toolNameMap as Map<string, string>).get(
+                          tc.function.name
+                        );
+                        toolNameRestored = true;
+                      }
                       // Key by index first — id only appears on the first delta in OpenAI streaming
                       let key: string;
                       if (Number.isInteger(tc?.index)) {
@@ -1330,7 +1343,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                     parsed.usage = filterUsageForFormat(buffered, FORMATS.OPENAI);
                     output = `data: ${JSON.stringify(parsed)}\n`;
                     injectedUsage = true;
-                  } else if (idFixed || needsReserialization) {
+                  } else if (idFixed || needsReserialization || toolNameRestored) {
                     output = `data: ${JSON.stringify(parsed)}\n`;
                     injectedUsage = true;
                   }
