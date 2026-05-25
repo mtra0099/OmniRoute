@@ -6641,6 +6641,24 @@ function ConnectionRow({
                 {connection.lastError}
               </span>
             )}
+            {connection.providerSpecificData?.linkedApiConnectionId && (
+              <span
+                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs font-medium bg-emerald-500/15 text-emerald-500"
+                title={`API also connected (${(connection.providerSpecificData as { linkedApiKeyPrefix?: string })?.linkedApiKeyPrefix ?? ""}…)`}
+              >
+                <span className="material-symbols-outlined text-[11px]">vpn_key</span>
+                API ✓
+              </span>
+            )}
+            {connection.providerSpecificData?.linkedOAuthConnectionId && (
+              <span
+                className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-xs font-medium bg-blue-500/15 text-blue-500"
+                title="OAuth login also connected"
+              >
+                <span className="material-symbols-outlined text-[11px]">login</span>
+                OAuth ✓
+              </span>
+            )}
             <span className="text-xs text-text-muted">#{connection.priority}</span>
             {connection.globalPriority && (
               <span className="text-xs text-text-muted">
