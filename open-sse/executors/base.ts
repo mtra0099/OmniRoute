@@ -918,30 +918,63 @@ export class BaseExecutor {
             tb.messages = stripTrailingAssistantOrphanToolUse(adjacent);
           }
         }
-        // Force composer-api (standardagents Worker) into Agent mode by ensuring
-        // outbound requests carry at least one tool. composer-api flips to Agent
-        // when tools.length > 0; otherwise composer-2.5 defaults to "Ask" and
-        // refuses to use tools. Idempotent: only injects when no real tools and
-        // tool_choice isn't explicitly "none".
+        // Cursor models via composer-api (standardagents Worker): composer-2.5 is
+        // hard-trained on Cursor's own tool names (Read/Grep/Write/Edit/Bash) and
+        // will hallucinate them instead of the client's actual tools, then spiral
+        // into "I'm in ask mode" refusals when those calls fail. Counter both:
+        //   1. ensure >=1 tool so composer-api sets composerMode = "Agent"
+        //   2. inject a system directive asserting agent mode + the EXACT tool
+        //      names available + an explicit ban on Cursor-native names.
         {
           const tb = transformedBody as Record<string, unknown>;
           const baseUrl = String(
             (activeCredentials as { providerSpecificData?: { baseUrl?: unknown } } | null | undefined)
               ?.providerSpecificData?.baseUrl ?? ""
           );
-          const hasTools = Array.isArray(tb.tools) && tb.tools.length > 0;
-          const toolChoice = tb.tool_choice;
-          if (/(?:standardagents\.ai|cursor-api)/i.test(baseUrl) && !hasTools && toolChoice !== "none") {
-            tb.tools = [
-              {
-                type: "function",
-                function: {
-                  name: "_force_agent_mode",
-                  description: "internal marker — do not call",
-                  parameters: { type: "object", properties: {}, additionalProperties: false },
+          if (/(?:standardagents\.ai|cursor-api)/i.test(baseUrl)) {
+            const toolsArr = Array.isArray(tb.tools)
+              ? (tb.tools as Array<Record<string, unknown>>)
+              : [];
+            if (toolsArr.length === 0 && tb.tool_choice !== "none") {
+              tb.tools = [
+                {
+                  type: "function",
+                  function: {
+                    name: "_force_agent_mode",
+                    description: "internal marker — do not call",
+                    parameters: { type: "object", properties: {}, additionalProperties: false },
+                  },
                 },
-              },
-            ];
+              ];
+            }
+            const toolNames = (Array.isArray(tb.tools) ? (tb.tools as Array<Record<string, unknown>>) : [])
+              .map((t) => (t?.function as { name?: unknown } | undefined)?.name)
+              .filter((n): n is string => typeof n === "string" && n.length > 0);
+            const nameList =
+              toolNames.length > 0 ? toolNames.join(", ") : "(the tools provided in this request)";
+            const directive =
+              "OPERATING MODE: You are in AGENT MODE with full tool access right now. You can read, " +
+              "write, edit, and create files and run commands using the tools provided. You are NOT in " +
+              "ask mode or read-only mode — never say you are, and never refuse an action by citing a " +
+              "mode restriction. " +
+              "TOOL NAMES: you MUST call tools using ONLY these exact names: " +
+              nameList +
+              ". Do NOT call Read, Write, Edit, MultiEdit, Grep, Glob, LS, Bash, or any name not in that " +
+              "list — those tools DO NOT EXIST in this environment and calling them fails. Map intent to " +
+              "the correct provided name (search→search_files, read→read_file, write/edit→write_file or " +
+              "patch, shell→terminal). When asked to do something, do it immediately with the correct tool.";
+            if (Array.isArray(tb.messages)) {
+              const msgs = tb.messages as Array<Record<string, unknown>>;
+              const sys = msgs.find((m) => m && (m as { role?: unknown }).role === "system");
+              if (sys && typeof (sys as { content?: unknown }).content === "string") {
+                const c = (sys as { content: string }).content;
+                if (!c.includes("OPERATING MODE:")) {
+                  (sys as { content: string }).content = directive + "\n\n" + c;
+                }
+              } else {
+                msgs.unshift({ role: "system", content: directive });
+              }
+            }
           }
         }
         let bodyString = JSON.stringify(transformedBody);
