@@ -160,6 +160,24 @@ export async function POST(request: Request) {
       testStatus: testStatus || "unknown",
     });
 
+    // If this is a Cursor-API-key connection, try to auto-link to a matching OAuth Cursor connection
+    try {
+      const { linkApiToOAuthConnections } = await import(
+        "@/lib/oauth/cursorAccountLinking"
+      );
+      await linkApiToOAuthConnections({
+        id: (newConnection as { id: string }).id,
+        provider: (newConnection as { provider: string }).provider,
+        authType: "apikey",
+        apiKey,
+        providerSpecificData:
+          (newConnection as { providerSpecificData?: Record<string, unknown> | null })
+            .providerSpecificData ?? providerSpecificData,
+      });
+    } catch (e) {
+      console.warn("[providers-create] auto-link to Cursor OAuth failed (non-fatal):", e);
+    }
+
     // Note: Gemini model sync is now triggered client-side with progress dialog
 
     // Hide sensitive fields

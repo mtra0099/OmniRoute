@@ -89,6 +89,16 @@ export async function POST(request: Request) {
       testStatus: "active",
     });
 
+    // Auto-link to a matching Cursor API-key connection if one exists
+    try {
+      const { linkOAuthToApiConnections } = await import(
+        "@/lib/oauth/cursorAccountLinking"
+      );
+      await linkOAuthToApiConnections(connection);
+    } catch (e) {
+      console.warn("[cursor-import] auto-link failed (non-fatal):", e);
+    }
+
     // Auto sync to Cloud if enabled
     await syncToCloudIfEnabled();
 
