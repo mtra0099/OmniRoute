@@ -918,6 +918,32 @@ export class BaseExecutor {
             tb.messages = stripTrailingAssistantOrphanToolUse(adjacent);
           }
         }
+        // Force composer-api (standardagents Worker) into Agent mode by ensuring
+        // outbound requests carry at least one tool. composer-api flips to Agent
+        // when tools.length > 0; otherwise composer-2.5 defaults to "Ask" and
+        // refuses to use tools. Idempotent: only injects when no real tools and
+        // tool_choice isn't explicitly "none".
+        {
+          const tb = transformedBody as Record<string, unknown>;
+          const baseUrl = String(
+            (activeCredentials as { providerSpecificData?: { baseUrl?: unknown } } | null | undefined)
+              ?.providerSpecificData?.baseUrl ?? ""
+          );
+          const hasTools = Array.isArray(tb.tools) && tb.tools.length > 0;
+          const toolChoice = tb.tool_choice;
+          if (/(?:standardagents\.ai|cursor-api)/i.test(baseUrl) && !hasTools && toolChoice !== "none") {
+            tb.tools = [
+              {
+                type: "function",
+                function: {
+                  name: "_force_agent_mode",
+                  description: "internal marker — do not call",
+                  parameters: { type: "object", properties: {}, additionalProperties: false },
+                },
+              },
+            ];
+          }
+        }
         let bodyString = JSON.stringify(transformedBody);
 
         const shouldFingerprint =
