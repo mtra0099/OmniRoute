@@ -4395,6 +4395,9 @@ function PassthroughModelsSection({
               compatDisabled={compatSavingModelId === modelId}
               onToggleHidden={onToggleHidden}
               togglingHidden={togglingModelId === modelId}
+              onTestModel={onTestModel}
+              testStatus={modelTestStatus[modelId] || null}
+              testingModel={testingModelId === modelId}
             />
           ))}
           {filteredModels.length === 0 && modelFilter && (
@@ -5371,6 +5374,9 @@ function CompatibleModelsSection({
               compatDisabled={compatSavingModelId === modelId}
               onToggleHidden={onToggleHidden}
               togglingHidden={togglingModelId === modelId}
+              onTestModel={onTestModel}
+              testStatus={modelTestStatus[modelId] || null}
+              testingModel={testingModelId === modelId}
             />
           ))}
           {filteredModels.length === 0 && modelFilter && (
