@@ -527,6 +527,121 @@ export function stripResponsesLifecycleEcho(parsed: unknown): boolean {
  * @param {object} options.body - Request body (for input token estimation)
  * @param {function} options.onComplete - Callback when stream finishes: ({ status, usage }) => void
  */
+// composer-api's /opencodev2 (Cursor SDK agent harness) emits Cursor's OWN built-in tool
+// names (read/shell/write/edit/grep/glob/ls/delete/semSearch). Harnesses whose tools are
+// named differently (Hermes: read_file/terminal/search_files/patch; Claude Code: Read/Bash)
+// reject those. Map each Cursor built-in name onto the client's declared tool so csr/ works
+// universally. Self-gating: only remaps when the emitted name is a Cursor built-in that is
+// NOT already one of the client's declared tools.
+const CURSOR_SDK_TOOL_CANDIDATES: Record<string, string[]> = {
+  read: ["read_file", "readFile", "read", "Read", "view", "open_file", "cat"],
+  write: ["write_file", "writeFile", "write", "Write", "create_file", "create"],
+  edit: ["edit", "edit_file", "apply_patch", "patch", "str_replace", "str_replace_editor", "Edit", "replace"],
+  shell: ["bash", "shell", "terminal", "run_command", "run_terminal_cmd", "Bash", "execute", "exec", "run", "command"],
+  grep: ["grep", "search_files", "ripgrep", "search", "Grep", "find_in_files"],
+  glob: ["glob", "find_files", "Glob", "list_files", "find"],
+  ls: ["list_directory", "list_dir", "list", "ls", "Ls", "dir"],
+  delete: ["delete", "delete_file", "remove", "rm", "Delete"],
+  semsearch: ["codebase_search", "semantic_search", "search", "Search"],
+  readlints: ["diagnostics", "get_diagnostics", "read_lints", "lints"],
+};
+
+function mapCursorSdkToolName(name: string, clientToolNames: Set<string>): string | null {
+  if (!name) return null;
+  if (clientToolNames.has(name)) return null; // already a client tool name; no remap needed
+  const candidates = CURSOR_SDK_TOOL_CANDIDATES[name.toLowerCase()];
+  if (!candidates) return null;
+  for (const c of candidates) {
+    if (clientToolNames.has(c)) return c;
+  }
+  return null;
+}
+
+type CursorClientToolParams = { properties?: Record<string, unknown>; required?: string[] };
+
+function pickClientArgKey(props: Record<string, unknown>, candidates: string[]): string | null {
+  for (const c of candidates) {
+    if (Object.prototype.hasOwnProperty.call(props, c)) return c;
+  }
+  return null;
+}
+
+// Re-key a Cursor SDK built-in tool's args onto the client tool's declared schema, and fill
+// required client params we can't source from Cursor (e.g. Hermes `terminal` requires `description`).
+// Cursor's own arg names (path/command/etc.) that don't exist on the client schema are dropped so
+// strict client validators don't reject the call.
+function remapCursorSdkArgs(
+  cursorName: string,
+  clientParams: CursorClientToolParams | undefined,
+  args: Record<string, unknown>
+): Record<string, unknown> {
+  const props =
+    clientParams?.properties && typeof clientParams.properties === "object"
+      ? (clientParams.properties as Record<string, unknown>)
+      : {};
+  const hasSchema = Object.keys(props).length > 0;
+  const required = Array.isArray(clientParams?.required) ? (clientParams.required as string[]) : [];
+  const a = args || {};
+  const out: Record<string, unknown> = {};
+  const put = (candidates: string[], value: unknown) => {
+    if (value === undefined || value === null) return;
+    const key = hasSchema ? pickClientArgKey(props, candidates) : candidates[0];
+    if (key) out[key] = value;
+  };
+  const PATH = ["path", "filePath", "file_path", "filepath", "file", "target_file", "absolute_path"];
+  const CONTENT = ["content", "fileText", "file_text", "text", "contents", "new_string", "newContent", "body", "fileContents"];
+  switch (cursorName.toLowerCase()) {
+    case "read":
+      put(PATH, a.path);
+      put(["offset", "start_line", "startLine"], a.offset);
+      put(["limit", "end_line", "numLines", "lines"], a.limit);
+      break;
+    case "write":
+      put(PATH, a.path);
+      put(CONTENT, a.fileText ?? a.content ?? a.streamContent ?? a.text);
+      break;
+    case "edit":
+      put(PATH, a.path);
+      put(["old_string", "oldText", "old_str", "search", "find"], a.oldText ?? a.old_string);
+      put(["new_string", "newText", "new_str", "replace", ...CONTENT], a.streamContent ?? a.newText ?? a.new_string ?? a.content);
+      break;
+    case "shell":
+      put(["command", "cmd", "shell_command", "script", "commandLine"], a.command);
+      break;
+    case "grep":
+      put(["pattern", "query", "regex", "search", "searchPattern"], a.pattern);
+      put(PATH, a.path);
+      put(["include", "glob", "filter", "files", "fileType", "type"], a.glob ?? a.include);
+      break;
+    case "glob":
+      put(["pattern", "glob", "globPattern", "query", "filePattern"], a.globPattern ?? a.pattern ?? a.include);
+      put(["path", "directory", "targetDirectory", "cwd", "searchPath"], a.path ?? a.targetDirectory);
+      break;
+    case "ls":
+      put(["path", "directory", "dirPath", "filePath"], a.path);
+      break;
+    case "delete":
+      put(PATH, a.path);
+      break;
+    default:
+      return a; // unmodeled tool — pass args through unchanged
+  }
+  for (const r of required) {
+    if (Object.prototype.hasOwnProperty.call(out, r)) continue;
+    const rl = r.toLowerCase();
+    if (
+      rl.includes("description") ||
+      rl.includes("explanation") ||
+      rl.includes("purpose") ||
+      rl.includes("reason") ||
+      rl.includes("intent")
+    ) {
+      out[r] = "Action requested by the model.";
+    }
+  }
+  return out;
+}
+
 export function createSSEStream(options: StreamOptions = {}) {
   const {
     mode = STREAM_MODE.TRANSLATE,
@@ -575,6 +690,26 @@ export function createSSEStream(options: StreamOptions = {}) {
   const passthroughToolCalls = new Map<string, ToolCall>();
   let passthroughToolCallSeq = 0;
   let skipPassthroughEvent = false;
+
+  // csr/opencodev2 tool-name mapping gate: only the Cursor composer-api ("csr"/"csra") nodes,
+  // and collect the client's declared tool names so SDK built-in names can be mapped onto them.
+  const csrSdkToolMapping =
+    typeof provider === "string" && provider.startsWith("openai-compatible-chat-csr");
+  const clientToolNames = new Set<string>();
+  const clientToolDefs = new Map<string, { properties?: Record<string, unknown>; required?: string[] }>();
+  const bodyToolsForMap = (body as { tools?: unknown } | null)?.tools;
+  if (csrSdkToolMapping && Array.isArray(bodyToolsForMap)) {
+    for (const t of bodyToolsForMap as Array<{ function?: { name?: unknown; parameters?: unknown } }>) {
+      const n = t?.function?.name;
+      if (typeof n === "string" && n) {
+        clientToolNames.add(n);
+        const p = t.function?.parameters;
+        if (p && typeof p === "object") {
+          clientToolDefs.set(n, p as { properties?: Record<string, unknown>; required?: string[] });
+        }
+      }
+    }
+  }
 
   // State for translate mode (accumulatedContent for call log response body)
   const state: TranslateState | null =
@@ -1249,11 +1384,37 @@ export function createSSEStream(options: StreamOptions = {}) {
                   // to avoid blocking subsequent finish_reason / usage mutations)
                   const needsReserialization =
                     hadReasoningAlias || (delta?.content === "" && delta?.reasoning_content);
+                  let toolNamesRemapped = false;
 
                   // T18: Track if we saw tool calls & accumulate for call log
                   if (delta?.tool_calls && delta.tool_calls.length > 0) {
                     passthroughHasToolCalls = true;
                     for (const tc of delta.tool_calls) {
+                      // csr/opencodev2: rename Cursor SDK built-in tool names onto the client's declared tools
+                      if (csrSdkToolMapping && tc?.function?.name) {
+                        const originalCursorName = tc.function.name;
+                        const mappedName = mapCursorSdkToolName(originalCursorName, clientToolNames);
+                        if (mappedName) {
+                          tc.function.name = mappedName;
+                          toolNamesRemapped = true;
+                          if (typeof tc.function.arguments === "string" && tc.function.arguments.trim()) {
+                            try {
+                              const parsedArgs = JSON.parse(tc.function.arguments);
+                              if (parsedArgs && typeof parsedArgs === "object" && !Array.isArray(parsedArgs)) {
+                                tc.function.arguments = JSON.stringify(
+                                  remapCursorSdkArgs(
+                                    originalCursorName,
+                                    clientToolDefs.get(mappedName),
+                                    parsedArgs as Record<string, unknown>
+                                  )
+                                );
+                              }
+                            } catch {
+                              /* partial / non-JSON args delta — leave as-is */
+                            }
+                          }
+                        }
+                      }
                       // Key by index first — id only appears on the first delta in OpenAI streaming
                       let key: string;
                       if (Number.isInteger(tc?.index)) {
@@ -1331,7 +1492,7 @@ export function createSSEStream(options: StreamOptions = {}) {
                     parsed.usage = filterUsageForFormat(buffered, FORMATS.OPENAI);
                     output = `data: ${JSON.stringify(parsed)}\n`;
                     injectedUsage = true;
-                  } else if (idFixed || needsReserialization) {
+                  } else if (idFixed || needsReserialization || toolNamesRemapped) {
                     output = `data: ${JSON.stringify(parsed)}\n`;
                     injectedUsage = true;
                   }
