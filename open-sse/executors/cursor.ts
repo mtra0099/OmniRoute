@@ -423,6 +423,21 @@ const debugLog = (...args: unknown[]) => {
 // turns can be longer. Five minutes is generous but bounded.
 const CURSOR_STREAM_TIMEOUT_MS = parseInt(process.env.CURSOR_STREAM_TIMEOUT_MS || "300000", 10);
 
+// Phase 11: cold-stream stall recovery. Cursor's agent.v1 backend
+// intermittently accepts a cold request but then never emits a single frame on
+// agentic tool turns — the h2 "data" event never fires and the stream hangs
+// until the readiness wrap 504s (~80-120s). A fresh stream almost always
+// produces frames within seconds (which is why a client-side retry succeeds in
+// 2-5s), so when the upstream sends NO bytes within CURSOR_FIRST_BYTE_TIMEOUT_MS
+// on a cold open (before any client byte is emitted), tear it down and re-drive
+// a fresh stream, up to CURSOR_MAX_COLD_RESTARTS times. 3 attempts x 22s = 66s
+// stays under the 80s readiness floor, so a recovery beats the 504, not races it.
+const CURSOR_FIRST_BYTE_TIMEOUT_MS = parseInt(
+  process.env.CURSOR_FIRST_BYTE_TIMEOUT_MS || "22000",
+  10
+);
+const CURSOR_MAX_COLD_RESTARTS = parseInt(process.env.CURSOR_MAX_COLD_RESTARTS || "2", 10);
+
 type CursorHttpResponse = {
   status: number;
   headers: Record<string, unknown>;
@@ -498,6 +513,11 @@ export type StreamCtx = {
   // to treat Cursor's KV save frame as an end-of-response marker because
   // thinking models can emit KV traffic before the later text/tool_call frame.
   receivedText: boolean;
+  // Phase 11: set true the first time the upstream h2 stream emits ANY bytes
+  // (even pre-content thinking/keepalive frames). The cold-stream stall
+  // watchdog uses this to tell a hung stream (no bytes at all) apart from a
+  // slow-but-alive one, so it never aborts a legitimately slow thinking turn.
+  sawUpstreamData: boolean;
   kvAfterTextSeen: boolean;
   endReason: "turn_ended" | "kv_after_text" | "tool_calls" | "server_end" | null;
   // Mid-stream JSON error (rare; emitted once with the error code).
@@ -656,6 +676,7 @@ export function newStreamCtx(
     thinkingText: "",
     tokenDelta: 0,
     receivedText: false,
+    sawUpstreamData: false,
     kvAfterTextSeen: false,
     endReason: null,
     midStreamError: null,
@@ -1211,6 +1232,7 @@ export class CursorExecutor extends BaseExecutor {
       }, CURSOR_STREAM_TIMEOUT_MS);
 
       const onData = (chunk: Buffer) => {
+        ctx.sawUpstreamData = true;
         if (CURSOR_DEBUG && process.env.CURSOR_DUMP_FILE) {
           fs.appendFileSync(process.env.CURSOR_DUMP_FILE, chunk);
         }
@@ -1449,6 +1471,10 @@ export class CursorExecutor extends BaseExecutor {
     let session: CursorSession | undefined;
     let h2: H2Like;
     let blobStore: Map<string, Buffer>;
+    // Phase 11: true once we open a fresh ("cold") h2 stream in this call, so the
+    // stall watchdog only re-drives cold opens — never inline tool-result
+    // resumes, which carry live session state on the existing stream.
+    let coldOpen = false;
 
     if (useInlineToolFollowUp) {
       session = cursorSessionManager.acquire(conversationId);
@@ -1497,6 +1523,7 @@ export class CursorExecutor extends BaseExecutor {
     }
 
     if (!session) {
+      coldOpen = true;
       // Cold path: open fresh h2 stream with the full message history
       // flattened into UserText (Phase 6 flattenMessages handles role:"tool"
       // and assistant.tool_calls).
@@ -1533,16 +1560,99 @@ export class CursorExecutor extends BaseExecutor {
     }
 
     // Closure to share the post-drive lifecycle between stream/non-stream paths.
-    const sessionToUse = session;
+    // activeSession is mutable: a cold-stream restart (driveWithRestart) closes
+    // the hung session and registers a fresh one, and finishLifecycle must act
+    // on whichever session is live when the drive finishes.
+    let activeSession = session;
     const finishLifecycle = (ctx: StreamCtx, errored: boolean) => {
       // Persist any new pendingToolCalls from this turn into the session.
       for (const [id, info] of ctx.pendingToolCalls) {
-        sessionToUse.pendingToolCalls.set(id, info);
+        activeSession.pendingToolCalls.set(id, info);
       }
       if (errored || ctx.endReason !== "tool_calls") {
-        cursorSessionManager.close(sessionToUse);
+        cursorSessionManager.close(activeSession);
       } else {
-        cursorSessionManager.release(sessionToUse, "awaiting_tool_result");
+        cursorSessionManager.release(activeSession, "awaiting_tool_result");
+      }
+    };
+
+    // Phase 11: re-drive a cold stream that hung without emitting any bytes.
+    // Rebuilds the full flattened history and opens a brand-new h2 stream
+    // (exactly what a client-side retry does, which succeeds in seconds), then
+    // re-registers the session so multi-turn reuse keeps working afterward.
+    const reopenColdH2 = async (): Promise<H2Like> => {
+      try {
+        cursorSessionManager.close(activeSession);
+      } catch {}
+      const rebuilt = this.buildRequest(model, body);
+      blobStore = rebuilt.blobStore;
+      const reopened = await this.openH2(url, headers, rebuilt.body, signal);
+      if (reopened.status !== 200) {
+        await reopened.consumeError().catch(() => {});
+        throw new Error(`cursor cold re-drive failed: upstream status ${reopened.status}`);
+      }
+      activeSession = cursorSessionManager.open(
+        conversationId,
+        reopened.client,
+        reopened.req,
+        blobStore
+      );
+      return {
+        client: reopened.client,
+        req: reopened.req,
+        initialBytes: reopened.initialBytes,
+      };
+    };
+
+    // Drives the open h2 stream, restarting a hung COLD stream up to
+    // CURSOR_MAX_COLD_RESTARTS times. The watchdog only fires when the upstream
+    // has sent zero bytes AND nothing has been emitted to the client, so a
+    // restart is always SSE/JSON-coherent and a slow-but-streaming (thinking)
+    // turn is never interrupted.
+    const driveWithRestart = async (ctx: StreamCtx): Promise<void> => {
+      let attempt = 0;
+      for (;;) {
+        ctx.sawUpstreamData = false;
+        const attemptController = new AbortController();
+        const onOuterAbort = () => attemptController.abort();
+        if (signal) signal.addEventListener("abort", onOuterAbort);
+        let stalled = false;
+        const watchdog = setTimeout(() => {
+          if (!ctx.sawUpstreamData && !ctx.emittedRoleChunk) {
+            stalled = true;
+            attemptController.abort();
+          }
+        }, CURSOR_FIRST_BYTE_TIMEOUT_MS);
+        try {
+          await this.driveH2(
+            h2,
+            ctx,
+            mcpTools,
+            body.tools as OpenAITool[] | undefined,
+            blobStore,
+            attemptController.signal
+          );
+          return;
+        } catch (err) {
+          if (
+            stalled &&
+            coldOpen &&
+            !signal?.aborted &&
+            !ctx.emittedRoleChunk &&
+            attempt < CURSOR_MAX_COLD_RESTARTS
+          ) {
+            attempt++;
+            console.warn(
+              `[cursor-agent] cold stream sent no bytes in ${CURSOR_FIRST_BYTE_TIMEOUT_MS}ms; re-driving fresh stream (attempt ${attempt}/${CURSOR_MAX_COLD_RESTARTS})`
+            );
+            h2 = await reopenColdH2();
+            continue;
+          }
+          throw err;
+        } finally {
+          clearTimeout(watchdog);
+          if (signal) signal.removeEventListener("abort", onOuterAbort);
+        }
       }
     };
 
@@ -1557,14 +1667,7 @@ export class CursorExecutor extends BaseExecutor {
             completedToolResults
           );
           try {
-            await this.driveH2(
-              h2,
-              ctx,
-              mcpTools,
-              body.tools as OpenAITool[] | undefined,
-              blobStore,
-              signal
-            );
+            await driveWithRestart(ctx);
             this.finalizeSseStream(ctx, body);
             // If Cursor returned a Connect-RPC JSON error (e.g. credits
             // exhausted), tear down this account so the next request hits a
@@ -1602,14 +1705,7 @@ export class CursorExecutor extends BaseExecutor {
     // Non-streaming: drive to completion, return chat.completion JSON.
     const ctx = newStreamCtx(model, () => {}, completedToolResults);
     try {
-      await this.driveH2(
-        h2,
-        ctx,
-        mcpTools,
-        body.tools as OpenAITool[] | undefined,
-        blobStore,
-        signal
-      );
+      await driveWithRestart(ctx);
     } catch (err) {
       finishLifecycle(ctx, true);
       const message = err instanceof Error ? err.message : String(err);
