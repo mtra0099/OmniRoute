@@ -117,3 +117,8 @@ RUN --mount=type=cache,target=/root/.npm \
   npm install -g --no-audit --no-fund @openai/codex @anthropic-ai/claude-code droid openclaw@latest
 
 USER node
+
+# Re-applied for v3.8.5: install cursor-agent CLI for the Cursor login flow.
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/* && curl -fsS https://cursor.com/install | bash && ln -sf /root/.local/bin/cursor-agent /usr/local/bin/cursor-agent && cursor-agent --version
+USER node
