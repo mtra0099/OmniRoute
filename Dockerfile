@@ -27,6 +27,7 @@ RUN --mount=type=cache,target=/root/.npm \
   && node -e "require('better-sqlite3')(':memory:').close()"
 
 COPY . ./
+ENV NODE_OPTIONS=--max-old-space-size=6144
 RUN --mount=type=cache,target=/app/.next/cache \
   mkdir -p /app/data && npm run build -- --webpack
 
